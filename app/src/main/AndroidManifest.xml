@@ -6,7 +6,7 @@
     <application
         android:name=".TgApplication"
         android:allowBackup="false"
-        android:label="Telegram (Kotlin)"
+        android:label="Kotlingram"
         android:supportsRtl="true"
         android:theme="@android:style/Theme.Material.NoActionBar">
         <activity

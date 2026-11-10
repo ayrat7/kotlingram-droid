@@ -9,5 +9,5 @@ dependencyResolutionManagement {
         maven("https://jitpack.io")
     }
 }
-rootProject.name = "TgClient"
+rootProject.name = "kotlingram"
 include(":app")
