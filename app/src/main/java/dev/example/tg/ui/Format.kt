@@ -5,6 +5,7 @@ import android.content.Context
 import android.content.Intent
 import android.widget.Toast
 import androidx.core.content.FileProvider
+import dev.example.tg.data.Media
 import java.io.File
 import java.text.SimpleDateFormat
 import java.time.Instant
@@ -59,4 +60,15 @@ fun openFile(ctx: Context, path: String, mime: String?) {
     } catch (e: Exception) {
         Toast.makeText(ctx, "Не удалось открыть файл", Toast.LENGTH_SHORT).show()
     }
+}
+
+/** Короткая подпись вложения (для баннеров ответа/редактирования). */
+fun mediaLabel(m: Media?): String = when (m) {
+    is Media.Photo -> "Фото"
+    is Media.Video -> if (m.round) "Видеосообщение" else if (m.gif) "GIF" else "Видео"
+    is Media.Voice -> "Голосовое сообщение"
+    is Media.Audio -> m.title
+    is Media.Doc -> m.name
+    is Media.Sticker -> m.emoji + " Стикер"
+    null -> ""
 }

@@ -5,6 +5,7 @@ import android.net.Uri
 import android.os.Build
 import dev.example.tg.media.Attachments
 import dev.example.tg.media.Prepared
+import dev.example.tg.notify.Notifier
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
@@ -24,7 +25,7 @@ import kotlin.coroutines.resume
 import kotlin.coroutines.resumeWithException
 
 /** Вся работа с TDLib. Состояние отдаётся наружу через StateFlow. */
-class TgRepo(private val app: Context) {
+class TgRepo(private val app: Context, val settings: AppSettings) {
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.Default)
     private val prefs = app.getSharedPreferences("tg", Context.MODE_PRIVATE)
 
@@ -34,6 +35,12 @@ class TgRepo(private val app: Context) {
     @Volatile private var loadingOlder = false
     @Volatile private var reachedStart = false
     @Volatile private var emptyOlderTries = 0
+    @Volatile private var appForeground = false
+    @Volatile private var myId = 0L
+
+    val notifier = Notifier(app)
+    private val scopeMute = ConcurrentHashMap<String, Int>()
+    private val replyCache = ConcurrentHashMap<String, ReplyPreview>()
 
     private val chatMap = ConcurrentHashMap<Long, TdApi.Chat>()
     private val userNames = ConcurrentHashMap<Long, String>()
@@ -48,8 +55,36 @@ class TgRepo(private val app: Context) {
     /** Идёт подготовка вложений к отправке (копирование, сжатие). */
     val preparing = MutableStateFlow(false)
     val files = MutableStateFlow<Map<Int, FileState>>(emptyMap())
+    val me = MutableStateFlow<Profile?>(null)
+    val profileBusy = MutableStateFlow(false)
+    /** Подпись состояния соединения («Подключение…») или null, когда всё в порядке. */
+    val connection = MutableStateFlow<String?>(null)
+    /** Нейтральные сообщения для снэкбара (не ошибки). */
+    val info = MutableStateFlow<String?>(null)
+    /** Чат, который нужно открыть (из уведомления). */
+    val pendingOpen = MutableStateFlow<Long?>(null)
 
     // ---------- Запуск и ключи ----------
+
+    fun isLoggedIn(): Boolean = prefs.getBoolean("logged_in", false)
+
+    /** Приложение на экране или в фоне: влияет на уведомления и статус «в сети». */
+    fun setForeground(fg: Boolean) {
+        appForeground = fg
+        if (auth.value == Auth.Ready) sendOnline(fg)
+        if (fg) {
+            val cid = currentChatId
+            if (cid != 0L) {
+                val ids = messages.value.filter { !it.out }.takeLast(20).map { it.id }.toLongArray()
+                scope.launch { markRead(cid, ids) }
+                notifier.cancel(cid)
+            }
+        }
+    }
+
+    private fun sendOnline(on: Boolean) {
+        client?.send(TdApi.SetOption().apply { name = "online"; value = TdApi.OptionValueBoolean(on) }, null)
+    }
 
     fun start() {
         if (client != null) return
@@ -131,11 +166,20 @@ class TgRepo(private val app: Context) {
                 }
                 client?.send(p) { r -> if (r is TdApi.Error) error.value = "Ошибка параметров TDLib: ${r.message}" }
             }
-            is TdApi.AuthorizationStateWaitPhoneNumber -> auth.value = Auth.NeedPhone
+            is TdApi.AuthorizationStateWaitPhoneNumber -> {
+                prefs.edit().putBoolean("logged_in", false).apply()
+                me.value = null
+                notifier.cancelAll()
+                auth.value = Auth.NeedPhone
+            }
             is TdApi.AuthorizationStateWaitCode -> auth.value = Auth.NeedCode
             is TdApi.AuthorizationStateWaitPassword -> auth.value = Auth.NeedPassword
             is TdApi.AuthorizationStateReady -> {
+                prefs.edit().putBoolean("logged_in", true).apply()
                 auth.value = Auth.Ready
+                sendOnline(appForeground)
+                loadMe()
+                loadScopeSettings()
                 loadChats()
             }
             is TdApi.AuthorizationStateClosed -> {
@@ -226,6 +270,8 @@ class TgRepo(private val app: Context) {
                     unread = c.unreadCount,
                     time = c.lastMessage?.date ?: 0,
                     avatar = c.photo?.small?.id,
+                    muted = isMuted(c),
+                    isPrivate = c.type is TdApi.ChatTypePrivate,
                 )
             }
     }
@@ -238,6 +284,7 @@ class TgRepo(private val app: Context) {
         messages.value = emptyList()
         reachedStart = false
         emptyOlderTries = 0
+        notifier.cancel(id)
         scope.launch {
             try {
                 call(TdApi.OpenChat().apply { chatId = id })
@@ -328,18 +375,22 @@ class TgRepo(private val app: Context) {
 
     private fun local(p: String): TdApi.InputFileLocal = TdApi.InputFileLocal().apply { path = p }
 
-    private fun sendContent(cid: Long, content: TdApi.InputMessageContent) {
-        val req = TdApi.SendMessage().apply { chatId = cid; inputMessageContent = content }
+    private fun sendContent(cid: Long, content: TdApi.InputMessageContent, replyId: Long = 0L) {
+        val req = TdApi.SendMessage().apply {
+            chatId = cid
+            inputMessageContent = content
+            if (replyId != 0L) replyTo = TdApi.InputMessageReplyToMessage().apply { messageId = replyId }
+        }
         scope.launch { runCatching { call(req) }.onFailure { error.value = "Не отправлено: ${it.message}" } }
     }
 
-    fun send(msg: String) {
+    fun send(msg: String, replyId: Long = 0L) {
         val cid = currentChatId
         if (cid == 0L || msg.isBlank()) return
-        sendContent(cid, TdApi.InputMessageText().apply { text = fmtText(msg) })
+        sendContent(cid, TdApi.InputMessageText().apply { text = fmtText(msg) }, replyId)
     }
 
-    fun sendVoice(path: String, durationSec: Int, waveform: ByteArray) {
+    fun sendVoice(path: String, durationSec: Int, waveform: ByteArray, replyId: Long = 0L) {
         val cid = currentChatId
         if (cid == 0L) return
         sendContent(cid, TdApi.InputMessageVoiceNote().apply {
@@ -347,7 +398,7 @@ class TgRepo(private val app: Context) {
             duration = durationSec
             this.waveform = waveform
             caption = fmtText()
-        })
+        }, replyId)
     }
 
     /** Фото/видео из галереи (asFile = false) или любые файлы как документы (asFile = true). */
@@ -421,7 +472,11 @@ class TgRepo(private val app: Context) {
                 c.positions = (c.positions.filter { it.list::class != u.position.list::class } + u.position).toTypedArray()
                 publishChats()
             }
-            is TdApi.UpdateChatReadInbox -> chatMap[u.chatId]?.let { it.unreadCount = u.unreadCount; publishChats() }
+            is TdApi.UpdateChatReadInbox -> chatMap[u.chatId]?.let {
+                it.unreadCount = u.unreadCount
+                if (u.unreadCount == 0) notifier.cancel(u.chatId)
+                publishChats()
+            }
             is TdApi.UpdateChatReadOutbox -> {
                 chatMap[u.chatId]?.lastReadOutboxMessageId = u.lastReadOutboxMessageId
                 if (u.chatId == currentChatId) {
@@ -430,12 +485,41 @@ class TgRepo(private val app: Context) {
                     }
                 }
             }
-            is TdApi.UpdateNewMessage -> if (u.message.chatId == currentChatId) {
-                scope.launch {
-                    val ui = toUi(u.message)
-                    messages.update { l -> if (l.any { it.id == ui.id }) l else (l + ui).sortedBy { it.id } }
-                    if (!u.message.isOutgoing) markRead(u.message.chatId, longArrayOf(u.message.id))
+            is TdApi.UpdateNewMessage -> {
+                val msg = u.message
+                val isCurrent = msg.chatId == currentChatId
+                if (isCurrent) {
+                    scope.launch {
+                        val ui = toUi(msg)
+                        messages.update { l -> if (l.any { it.id == ui.id }) l else (l + ui).sortedBy { it.id } }
+                        if (!msg.isOutgoing && appForeground) markRead(msg.chatId, longArrayOf(msg.id))
+                    }
                 }
+                if (!msg.isOutgoing && !(isCurrent && appForeground)) maybeNotify(msg)
+            }
+            is TdApi.UpdateConnectionState -> connection.value = when (u.state) {
+                is TdApi.ConnectionStateReady -> null
+                is TdApi.ConnectionStateWaitingForNetwork -> "Ожидание сети…"
+                is TdApi.ConnectionStateConnectingToProxy -> "Подключение к прокси…"
+                is TdApi.ConnectionStateUpdating -> "Обновление…"
+                else -> "Подключение…"
+            }
+            is TdApi.UpdateUser -> if (u.user.id == myId) {
+                me.value = toProfile(u.user, me.value?.bio.orEmpty())
+            }
+            is TdApi.UpdateUserFullInfo -> if (u.userId == myId) {
+                me.value = me.value?.copy(bio = u.userFullInfo.bio?.text.orEmpty())
+            }
+            is TdApi.UpdateChatNotificationSettings -> chatMap[u.chatId]?.let {
+                it.notificationSettings = u.notificationSettings
+                publishChats()
+            }
+            is TdApi.UpdateScopeNotificationSettings -> {
+                scopeMute[scopeName(u.scope)] = u.notificationSettings.muteFor
+                publishChats()
+            }
+            is TdApi.UpdateMessageEdited -> if (u.chatId == currentChatId) {
+                messages.update { l -> l.map { if (it.id == u.messageId) it.copy(edited = u.editDate > 0) else it } }
             }
             is TdApi.UpdateMessageSendSucceeded -> if (u.message.chatId == currentChatId) {
                 scope.launch {
@@ -458,6 +542,251 @@ class TgRepo(private val app: Context) {
                 messages.update { l -> l.filter { it.id !in gone } }
             }
             else -> {}
+        }
+    }
+
+    // ---------- Действия над сообщениями ----------
+
+    fun edit(m: UiMsg, newText: String) {
+        if (newText.isBlank() || newText == m.text) return
+        val req: TdApi.Function<*> = if (m.media == null) {
+            TdApi.EditMessageText().apply {
+                chatId = m.chatId
+                messageId = m.id
+                inputMessageContent = TdApi.InputMessageText().apply { text = fmtText(newText) }
+            }
+        } else {
+            TdApi.EditMessageCaption().apply {
+                chatId = m.chatId
+                messageId = m.id
+                caption = fmtText(newText)
+            }
+        }
+        scope.launch { runCatching { call(req) }.onFailure { error.value = "Не удалось изменить: ${it.message}" } }
+    }
+
+    fun delete(m: UiMsg, forAll: Boolean) {
+        val req = TdApi.DeleteMessages().apply {
+            chatId = m.chatId
+            messageIds = longArrayOf(m.id)
+            revoke = forAll
+        }
+        scope.launch {
+            runCatching { call(req) }.onFailure { error.value = "Не удалось удалить: ${it.message}" }
+            // pending/локальные сообщения могут не прислать UpdateDeleteMessages
+            messages.update { l -> l.filter { it.id != m.id } }
+        }
+    }
+
+    fun forward(fromChat: Long, messageId: Long, toChat: Long) {
+        val req = TdApi.ForwardMessages().apply {
+            chatId = toChat
+            this.fromChatId = fromChat
+            messageIds = longArrayOf(messageId)
+            options = null
+            sendCopy = false
+            removeCaption = false
+        }
+        scope.launch {
+            runCatching { call(req) }
+                .onSuccess { info.value = "Сообщение переслано" }
+                .onFailure { error.value = "Не удалось переслать: ${it.message}" }
+        }
+    }
+
+    // ---------- Уведомления ----------
+
+    private fun scopeName(s: TdApi.NotificationSettingsScope): String = when (s) {
+        is TdApi.NotificationSettingsScopeGroupChats -> "group"
+        is TdApi.NotificationSettingsScopeChannelChats -> "channel"
+        else -> "private"
+    }
+
+    private fun scopeOf(c: TdApi.Chat): String = when (val t = c.type) {
+        is TdApi.ChatTypeBasicGroup -> "group"
+        is TdApi.ChatTypeSupergroup -> if (t.isChannel) "channel" else "group"
+        else -> "private"
+    }
+
+    private fun isMuted(c: TdApi.Chat): Boolean {
+        val s = c.notificationSettings ?: return false
+        val mute = if (s.useDefaultMuteFor) scopeMute[scopeOf(c)] ?: 0 else s.muteFor
+        return mute > 0
+    }
+
+    private fun loadScopeSettings() {
+        scope.launch {
+            val scopes = listOf(
+                "private" to TdApi.NotificationSettingsScopePrivateChats(),
+                "group" to TdApi.NotificationSettingsScopeGroupChats(),
+                "channel" to TdApi.NotificationSettingsScopeChannelChats(),
+            )
+            for ((name, sc) in scopes) {
+                runCatching {
+                    val r = call(TdApi.GetScopeNotificationSettings().apply { scope = sc }) as TdApi.ScopeNotificationSettings
+                    scopeMute[name] = r.muteFor
+                }
+            }
+            publishChats()
+        }
+    }
+
+    fun setMuted(cid: Long, mute: Boolean) {
+        val s = chatMap[cid]?.notificationSettings ?: return
+        s.useDefaultMuteFor = false
+        s.muteFor = if (mute) 367 * 24 * 3600 else 0
+        client?.send(TdApi.SetChatNotificationSettings().apply { chatId = cid; notificationSettings = s }, null)
+        publishChats()
+    }
+
+    private fun isNotifiable(c: TdApi.MessageContent) =
+        c is TdApi.MessageText || c is TdApi.MessagePhoto || c is TdApi.MessageVideo ||
+            c is TdApi.MessageAnimation || c is TdApi.MessageVoiceNote || c is TdApi.MessageVideoNote ||
+            c is TdApi.MessageAudio || c is TdApi.MessageDocument || c is TdApi.MessageSticker ||
+            c is TdApi.MessagePoll || c is TdApi.MessageLocation || c is TdApi.MessageContact
+
+    private fun maybeNotify(m: TdApi.Message) {
+        if (!settings.notifications.value || !isNotifiable(m.content)) return
+        val chat = chatMap[m.chatId] ?: return
+        if (isMuted(chat)) return
+        scope.launch {
+            val group = chat.type !is TdApi.ChatTypePrivate && chat.type !is TdApi.ChatTypeSecret
+            val sender = if (group) senderName(m).ifBlank { null } else null
+            val body = if (settings.preview.value) describe(m.content) else "Новое сообщение"
+            val avatar = chat.photo?.small?.let { f -> files.value[f.id]?.path }
+            notifier.incoming(m.chatId, chat.title.ifBlank { "Telegram" }, group, sender, body, m.id, avatar)
+        }
+    }
+
+    /** Ответ прямо из уведомления. */
+    fun replyFromNotification(cid: Long, lastMessageId: Long, text: String, done: () -> Unit) {
+        scope.launch {
+            try {
+                call(TdApi.SendMessage().apply {
+                    chatId = cid
+                    inputMessageContent = TdApi.InputMessageText().apply { this.text = fmtText(text) }
+                })
+                notifier.ownReply(cid, text)
+                if (lastMessageId != 0L) markRead(cid, longArrayOf(lastMessageId))
+            } catch (e: Exception) {
+                error.value = "Не отправлено: ${e.message}"
+            } finally {
+                done()
+            }
+        }
+    }
+
+    /** «Прочитано» из уведомления. */
+    fun markChatRead(cid: Long, messageId: Long, done: () -> Unit) {
+        scope.launch {
+            try {
+                if (messageId != 0L) markRead(cid, longArrayOf(messageId))
+                notifier.cancel(cid)
+            } finally {
+                done()
+            }
+        }
+    }
+
+    // ---------- Профиль ----------
+
+    private fun toProfile(u: TdApi.User, bio: String): Profile {
+        reg(u.profilePhoto?.small)
+        reg(u.profilePhoto?.big)
+        return Profile(
+            id = u.id,
+            firstName = u.firstName.orEmpty(),
+            lastName = u.lastName.orEmpty(),
+            username = u.usernames?.editableUsername.orEmpty(),
+            phone = u.phoneNumber.orEmpty(),
+            bio = bio,
+            avatarSmall = u.profilePhoto?.small?.id,
+            avatarBig = u.profilePhoto?.big?.id,
+            photoId = u.profilePhoto?.id ?: 0L,
+        )
+    }
+
+    private fun loadMe() {
+        scope.launch {
+            try {
+                val u = call(TdApi.GetMe()) as TdApi.User
+                myId = u.id
+                me.value = toProfile(u, me.value?.bio.orEmpty())
+                runCatching {
+                    val full = call(TdApi.GetUserFullInfo().apply { userId = u.id }) as TdApi.UserFullInfo
+                    me.value = me.value?.copy(bio = full.bio?.text.orEmpty())
+                }
+            } catch (e: Exception) {
+                error.value = e.message
+            }
+        }
+    }
+
+    private fun friendly(e: Throwable): String {
+        val m = e.message.orEmpty()
+        return when {
+            "USERNAME_OCCUPIED" in m -> "Это имя пользователя занято"
+            "USERNAME_INVALID" in m -> "Недопустимое имя пользователя"
+            "USERNAME_NOT_MODIFIED" in m -> "Имя пользователя не изменилось"
+            "FIRSTNAME_INVALID" in m -> "Недопустимое имя"
+            "FLOOD" in m -> "Слишком часто, попробуйте позже"
+            else -> m
+        }
+    }
+
+    fun saveProfile(first: String, last: String, uname: String, newBio: String) {
+        val p = me.value
+        scope.launch {
+            profileBusy.value = true
+            try {
+                if (p == null || first != p.firstName || last != p.lastName) {
+                    call(TdApi.SetName().apply { firstName = first; lastName = last })
+                }
+                if (p == null || uname != p.username) {
+                    call(TdApi.SetUsername().apply { username = uname })
+                }
+                if (p == null || newBio != p.bio) {
+                    call(TdApi.SetBio().apply { bio = newBio })
+                    me.value = me.value?.copy(bio = newBio)
+                }
+                info.value = "Профиль сохранён"
+            } catch (e: Exception) {
+                error.value = friendly(e)
+            } finally {
+                profileBusy.value = false
+            }
+        }
+    }
+
+    fun setAvatar(uri: Uri) {
+        scope.launch(Dispatchers.IO) {
+            profileBusy.value = true
+            try {
+                val path = Attachments.prepareAvatar(app, uri)
+                val inner = TdApi.InputChatPhotoStatic().apply { photo = local(path) }
+                call(TdApi.SetProfilePhoto().apply { photo = inner; isPublic = false })
+                info.value = "Фото профиля обновлено"
+            } catch (e: Exception) {
+                error.value = "Не удалось обновить фото: ${e.message}"
+            } finally {
+                profileBusy.value = false
+            }
+        }
+    }
+
+    fun deleteAvatar() {
+        val id = me.value?.photoId ?: return
+        if (id == 0L) return
+        scope.launch {
+            profileBusy.value = true
+            try {
+                call(TdApi.DeleteProfilePhoto().apply { profilePhotoId = id })
+                info.value = "Фото удалено"
+            } catch (e: Exception) {
+                error.value = e.message
+            } finally {
+                profileBusy.value = false
+            }
         }
     }
 
@@ -488,7 +817,24 @@ class TgRepo(private val app: Context) {
             media = media,
             pending = m.sendingState is TdApi.MessageSendingStatePending,
             read = m.isOutgoing && chat != null && m.id <= chat.lastReadOutboxMessageId,
+            edited = m.editDate > 0,
+            reply = replyPreview(m),
         )
+    }
+
+    private suspend fun replyPreview(m: TdApi.Message): ReplyPreview? {
+        val r = m.replyTo as? TdApi.MessageReplyToMessage ?: return null
+        if (r.messageId == 0L) return null
+        val cid = if (r.chatId != 0L) r.chatId else m.chatId
+        val key = "$cid:${r.messageId}"
+        replyCache[key]?.let { return it }
+        return try {
+            val o = call(TdApi.GetMessage().apply { chatId = cid; messageId = r.messageId }) as TdApi.Message
+            val author = if (o.isOutgoing) "Вы" else senderName(o).ifBlank { chatMap[o.chatId]?.title.orEmpty() }
+            ReplyPreview(o.id, author, describe(o.content)).also { replyCache[key] = it }
+        } catch (e: Exception) {
+            ReplyPreview(r.messageId, "", "Сообщение недоступно")
+        }
     }
 
     private suspend fun senderName(m: TdApi.Message): String {

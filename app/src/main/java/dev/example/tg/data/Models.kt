@@ -19,6 +19,8 @@ data class ChatItem(
     val time: Int,
     /** id файла аватарки (маленькая) */
     val avatar: Int?,
+    val muted: Boolean = false,
+    val isPrivate: Boolean = false,
 )
 
 /** Вложение сообщения. Везде хранятся только id файлов TDLib — состояние файла берётся из TgRepo.files. */
@@ -68,7 +70,27 @@ data class UiMsg(
     val media: Media? = null,
     val pending: Boolean = false,
     val read: Boolean = false,
+    val edited: Boolean = false,
+    val reply: ReplyPreview? = null,
 )
+
+/** Превью сообщения, на которое отвечает данное. */
+data class ReplyPreview(val id: Long, val author: String, val text: String)
+
+/** Свой аккаунт. */
+data class Profile(
+    val id: Long,
+    val firstName: String,
+    val lastName: String,
+    val username: String,
+    val phone: String,
+    val bio: String,
+    val avatarSmall: Int?,
+    val avatarBig: Int?,
+    val photoId: Long,
+) {
+    val fullName: String get() = "$firstName $lastName".trim()
+}
 
 /** Состояние файла TDLib (скачивание / загрузка). */
 data class FileState(

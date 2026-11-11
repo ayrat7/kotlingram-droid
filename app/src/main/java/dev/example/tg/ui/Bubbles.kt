@@ -4,15 +4,19 @@ import android.graphics.BitmapFactory
 import androidx.compose.foundation.Canvas
 import androidx.compose.foundation.Image
 import androidx.compose.foundation.background
+import androidx.compose.foundation.ExperimentalFoundationApi
 import androidx.compose.foundation.clickable
+import androidx.compose.foundation.combinedClickable
 import androidx.compose.foundation.gestures.detectTapGestures
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.BoxScope
+import androidx.compose.foundation.layout.IntrinsicSize
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.aspectRatio
+import androidx.compose.foundation.layout.fillMaxHeight
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
@@ -60,27 +64,30 @@ import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import coil.compose.AsyncImage
 import dev.example.tg.data.Media
+import dev.example.tg.data.ReplyPreview
 import dev.example.tg.data.UiMsg
 import dev.example.tg.media.Waveform
 import java.io.File
 
+@OptIn(ExperimentalFoundationApi::class)
 @Composable
-fun MessageItem(m: UiMsg, onOpen: (Media) -> Unit) {
+fun MessageItem(m: UiMsg, onOpen: (Media) -> Unit, onLong: () -> Unit, onJump: (Long) -> Unit) {
     val media = m.media
     Box(
         Modifier.fillMaxWidth().padding(horizontal = 8.dp),
         contentAlignment = if (m.out) Alignment.CenterEnd else Alignment.CenterStart,
     ) {
         when {
-            media is Media.Sticker -> StickerMessage(m, media)
-            media is Media.Video && media.round -> RoundVideoMessage(m, media, onOpen)
-            else -> Bubble(m, onOpen)
+            media is Media.Sticker -> StickerMessage(m, media, onLong)
+            media is Media.Video && media.round -> RoundVideoMessage(m, media, onOpen, onLong)
+            else -> Bubble(m, onOpen, onLong, onJump)
         }
     }
 }
 
+@OptIn(ExperimentalFoundationApi::class)
 @Composable
-private fun Bubble(m: UiMsg, onOpen: (Media) -> Unit) {
+private fun Bubble(m: UiMsg, onOpen: (Media) -> Unit, onLong: () -> Unit, onJump: (Long) -> Unit) {
     val cs = MaterialTheme.colorScheme
     val media = m.media
     val visual = media is Media.Photo || media is Media.Video
@@ -94,7 +101,9 @@ private fun Bubble(m: UiMsg, onOpen: (Media) -> Unit) {
         color = if (m.out) cs.primaryContainer else cs.surfaceContainerHigh,
         contentColor = if (m.out) cs.onPrimaryContainer else cs.onSurface,
         shape = shape,
-        modifier = if (visual) Modifier.width(260.dp) else Modifier.widthIn(max = 320.dp),
+        modifier = (if (visual) Modifier.width(260.dp) else Modifier.widthIn(max = 320.dp))
+            .clip(shape)
+            .combinedClickable(onClick = {}, onLongClick = onLong),
     ) {
         Column {
             if (!m.out && m.from.isNotBlank()) {
@@ -103,14 +112,15 @@ private fun Bubble(m: UiMsg, onOpen: (Media) -> Unit) {
                     modifier = Modifier.padding(start = 12.dp, end = 12.dp, top = 8.dp, bottom = if (visual) 6.dp else 0.dp),
                 )
             }
+            m.reply?.let { ReplyBlock(it) { onJump(it.id) } }
             Box {
                 Column {
                     when (media) {
-                        is Media.Photo -> PhotoContent(media) { onOpen(media) }
-                        is Media.Video -> VideoContent(media) { onOpen(media) }
-                        is Media.Voice -> VoiceContent(m, media)
+                        is Media.Photo -> PhotoContent(media, { onOpen(media) }, onLong)
+                        is Media.Video -> VideoContent(media, { onOpen(media) }, onLong)
+                        is Media.Voice -> VoiceContent(m, media, onLong)
                         is Media.Audio -> AudioContent(media)
-                        is Media.Doc -> DocContent(media)
+                        is Media.Doc -> DocContent(media, onLong)
                         else -> {}
                     }
                     if (m.text.isNotBlank()) {
@@ -133,11 +143,38 @@ private fun Bubble(m: UiMsg, onOpen: (Media) -> Unit) {
 }
 
 @Composable
+private fun ReplyBlock(r: ReplyPreview, onClick: () -> Unit) {
+    val cs = MaterialTheme.colorScheme
+    Row(
+        Modifier.padding(start = 8.dp, end = 8.dp, top = 6.dp, bottom = 2.dp)
+            .clip(RoundedCornerShape(8.dp))
+            .background(cs.primary.copy(alpha = 0.12f))
+            .clickable(onClick = onClick)
+            .height(IntrinsicSize.Min),
+    ) {
+        Box(Modifier.width(3.dp).fillMaxHeight().background(cs.primary))
+        Column(Modifier.padding(horizontal = 8.dp, vertical = 4.dp)) {
+            if (r.author.isNotBlank()) {
+                Text(
+                    r.author, style = MaterialTheme.typography.labelMedium, color = cs.primary,
+                    fontWeight = FontWeight.Bold, maxLines = 1, overflow = TextOverflow.Ellipsis,
+                )
+            }
+            Text(r.text, style = MaterialTheme.typography.bodySmall, maxLines = 1, overflow = TextOverflow.Ellipsis)
+        }
+    }
+}
+
+@Composable
 private fun MetaRow(
     m: UiMsg, modifier: Modifier = Modifier,
     tint: Color = LocalContentColor.current.copy(alpha = 0.6f),
 ) {
     Row(modifier, verticalAlignment = Alignment.CenterVertically) {
+        if (m.edited) {
+            Text("изм.", style = MaterialTheme.typography.labelSmall, color = tint)
+            Spacer(Modifier.width(4.dp))
+        }
         Text(formatClock(m.time), style = MaterialTheme.typography.labelSmall, color = tint)
         if (m.out) {
             Spacer(Modifier.width(3.dp))
@@ -168,11 +205,12 @@ fun MiniThumb(bytes: ByteArray?, modifier: Modifier = Modifier) {
     }
 }
 
+@OptIn(ExperimentalFoundationApi::class)
 @Composable
-private fun PhotoContent(p: Media.Photo, onClick: () -> Unit) {
+private fun PhotoContent(p: Media.Photo, onClick: () -> Unit, onLong: () -> Unit) {
     val f = rememberFile(p.file)
     val ratio = if (p.width > 0 && p.height > 0) (p.width.toFloat() / p.height).coerceIn(0.6f, 1.8f) else 1f
-    Box(Modifier.fillMaxWidth().aspectRatio(ratio).background(Color.Black.copy(alpha = 0.1f)).clickable(onClick = onClick)) {
+    Box(Modifier.fillMaxWidth().aspectRatio(ratio).background(Color.Black.copy(alpha = 0.1f)).combinedClickable(onClick = onClick, onLongClick = onLong)) {
         MiniThumb(p.mini, Modifier.fillMaxSize())
         val path = f?.path
         if (path != null) {
@@ -231,19 +269,21 @@ private fun DurationChip(v: Media.Video, modifier: Modifier) {
     }
 }
 
+@OptIn(ExperimentalFoundationApi::class)
 @Composable
-private fun VideoContent(v: Media.Video, onClick: () -> Unit) {
+private fun VideoContent(v: Media.Video, onClick: () -> Unit, onLong: () -> Unit) {
     val ratio = if (v.width > 0 && v.height > 0) (v.width.toFloat() / v.height).coerceIn(0.6f, 1.8f) else 1.33f
-    Box(Modifier.fillMaxWidth().aspectRatio(ratio).clickable(onClick = onClick)) {
+    Box(Modifier.fillMaxWidth().aspectRatio(ratio).combinedClickable(onClick = onClick, onLongClick = onLong)) {
         VideoThumb(v, Modifier.fillMaxSize())
         PlayOverlay(v.file)
         DurationChip(v, Modifier.align(Alignment.TopStart).padding(6.dp))
     }
 }
 
+@OptIn(ExperimentalFoundationApi::class)
 @Composable
-private fun RoundVideoMessage(m: UiMsg, v: Media.Video, onOpen: (Media) -> Unit) {
-    Box(Modifier.size(200.dp).clip(CircleShape).clickable { onOpen(v) }) {
+private fun RoundVideoMessage(m: UiMsg, v: Media.Video, onOpen: (Media) -> Unit, onLong: () -> Unit) {
+    Box(Modifier.size(200.dp).clip(CircleShape).combinedClickable(onClick = { onOpen(v) }, onLongClick = onLong)) {
         VideoThumb(v, Modifier.fillMaxSize())
         PlayOverlay(v.file)
         DurationChip(v, Modifier.align(Alignment.TopCenter).padding(top = 10.dp))
@@ -251,10 +291,11 @@ private fun RoundVideoMessage(m: UiMsg, v: Media.Video, onOpen: (Media) -> Unit)
     }
 }
 
+@OptIn(ExperimentalFoundationApi::class)
 @Composable
-private fun StickerMessage(m: UiMsg, s: Media.Sticker) {
+private fun StickerMessage(m: UiMsg, s: Media.Sticker, onLong: () -> Unit) {
     val f = rememberFile(if (s.renderable) s.file else s.thumb)
-    Box(Modifier.size(160.dp)) {
+    Box(Modifier.size(160.dp).combinedClickable(onClick = {}, onLongClick = onLong)) {
         val path = f?.path
         if (path != null) {
             AsyncImage(File(path), null, Modifier.fillMaxSize(), contentScale = ContentScale.Fit)
@@ -296,12 +337,13 @@ private fun PlayButton(fileId: Int, playing: Boolean, onToggle: (path: String) -
 }
 
 @Composable
-private fun WaveformBar(data: ByteArray, progress: Float, modifier: Modifier, onSeek: (Float) -> Unit) {
+private fun WaveformBar(data: ByteArray, progress: Float, modifier: Modifier, onSeek: (Float) -> Unit, onLong: () -> Unit) {
     val bars = remember(data) { Waveform.display(data, 40) }
     val active = MaterialTheme.colorScheme.primary
     val inactive = LocalContentColor.current.copy(alpha = 0.35f)
     val seek by rememberUpdatedState(onSeek)
-    Canvas(modifier.pointerInput(Unit) { detectTapGestures { seek(it.x / size.width) } }) {
+    val long by rememberUpdatedState(onLong)
+    Canvas(modifier.pointerInput(Unit) { detectTapGestures(onLongPress = { long() }, onTap = { seek(it.x / size.width) }) }) {
         val n = bars.size
         val gap = 2.dp.toPx()
         val bw = ((size.width - gap * (n - 1)) / n).coerceAtLeast(1f)
@@ -318,7 +360,7 @@ private fun WaveformBar(data: ByteArray, progress: Float, modifier: Modifier, on
 }
 
 @Composable
-private fun VoiceContent(m: UiMsg, v: Media.Voice) {
+private fun VoiceContent(m: UiMsg, v: Media.Voice, onLong: () -> Unit) {
     val repo = LocalRepo.current
     val player = LocalPlayer.current
     val ps by player.state.collectAsState()
@@ -341,6 +383,7 @@ private fun VoiceContent(m: UiMsg, v: Media.Voice) {
             WaveformBar(
                 v.waveform, progress, Modifier.fillMaxWidth().height(30.dp),
                 onSeek = { player.seekToFraction(v.file, it) },
+                onLong = onLong,
             )
             Row(verticalAlignment = Alignment.CenterVertically) {
                 Text(
@@ -390,18 +433,22 @@ private fun AudioContent(a: Media.Audio) {
 
 // ---------- Документы ----------
 
+@OptIn(ExperimentalFoundationApi::class)
 @Composable
-private fun DocContent(d: Media.Doc) {
+private fun DocContent(d: Media.Doc, onLong: () -> Unit) {
     val ctx = LocalContext.current
     val repo = LocalRepo.current
     val f = rememberFile(d.file, auto = false)
     val cs = MaterialTheme.colorScheme
     Row(
         Modifier.fillMaxWidth()
-            .clickable {
-                val p = f?.path
-                if (p != null) openFile(ctx, p, d.mime) else repo.download(d.file)
-            }
+            .combinedClickable(
+                onClick = {
+                    val p = f?.path
+                    if (p != null) openFile(ctx, p, d.mime) else repo.download(d.file)
+                },
+                onLongClick = onLong,
+            )
             .padding(12.dp),
         verticalAlignment = Alignment.CenterVertically,
         horizontalArrangement = Arrangement.spacedBy(12.dp),

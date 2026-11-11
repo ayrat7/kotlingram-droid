@@ -88,6 +88,30 @@ object Attachments {
         return Prepared.Photo(out.absolutePath, bmp.width, bmp.height)
     }
 
+    /** Квадратная обрезка по центру до 1024 px — для фото профиля. */
+    fun prepareAvatar(ctx: Context, uri: Uri): String {
+        val cr = ctx.contentResolver
+        val bounds = BitmapFactory.Options().apply { inJustDecodeBounds = true }
+        cr.openInputStream(uri)?.use { BitmapFactory.decodeStream(it, null, bounds) }
+        if (bounds.outWidth <= 0 || bounds.outHeight <= 0) throw IOException("Не удалось прочитать изображение")
+        var sample = 1
+        while (minOf(bounds.outWidth, bounds.outHeight) / sample > 2048) sample *= 2
+        var bmp: Bitmap = cr.openInputStream(uri)?.use {
+            BitmapFactory.decodeStream(it, null, BitmapFactory.Options().apply { inSampleSize = sample })
+        } ?: throw IOException("Не удалось прочитать изображение")
+        val rot = cr.openInputStream(uri)?.use { rotation(it) } ?: 0
+        if (rot != 0) {
+            val m = Matrix().apply { postRotate(rot.toFloat()) }
+            bmp = Bitmap.createBitmap(bmp, 0, 0, bmp.width, bmp.height, m, true)
+        }
+        val side = minOf(bmp.width, bmp.height)
+        var sq = Bitmap.createBitmap(bmp, (bmp.width - side) / 2, (bmp.height - side) / 2, side, side)
+        if (side > 1024) sq = Bitmap.createScaledBitmap(sq, 1024, 1024, true)
+        val out = File(root(ctx), "avatar_${System.nanoTime()}.jpg")
+        out.outputStream().use { sq.compress(Bitmap.CompressFormat.JPEG, 92, it) }
+        return out.absolutePath
+    }
+
     private fun rotation(s: InputStream): Int =
         when (ExifInterface(s).getAttributeInt(ExifInterface.TAG_ORIENTATION, ExifInterface.ORIENTATION_NORMAL)) {
             ExifInterface.ORIENTATION_ROTATE_90 -> 90

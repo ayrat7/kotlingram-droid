@@ -11,6 +11,7 @@ import androidx.compose.runtime.Composable
 import androidx.compose.runtime.staticCompositionLocalOf
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.platform.LocalContext
+import dev.example.tg.data.ThemeMode
 import dev.example.tg.data.TgRepo
 import dev.example.tg.media.AudioPlayer
 import dev.example.tg.media.VoiceRecorder
@@ -44,14 +45,26 @@ private val DarkScheme = darkColorScheme(
 )
 
 @Composable
-fun TgTheme(content: @Composable () -> Unit) {
-    val dark = isSystemInDarkTheme()
+fun TgTheme(mode: ThemeMode, dynamic: Boolean, content: @Composable () -> Unit) {
+    val dark = when (mode) {
+        ThemeMode.System -> isSystemInDarkTheme()
+        ThemeMode.Light -> false
+        ThemeMode.Dark -> true
+    }
     val ctx = LocalContext.current
     val scheme = when {
-        Build.VERSION.SDK_INT >= Build.VERSION_CODES.S ->
+        dynamic && Build.VERSION.SDK_INT >= Build.VERSION_CODES.S ->
             if (dark) dynamicDarkColorScheme(ctx) else dynamicLightColorScheme(ctx)
         dark -> DarkScheme
         else -> LightScheme
     }
     MaterialTheme(colorScheme = scheme, content = content)
+}
+
+/** Тёмная ли тема при данном режиме (нужно для цвета иконок системных баров). */
+@Composable
+fun isDarkFor(mode: ThemeMode): Boolean = when (mode) {
+    ThemeMode.System -> isSystemInDarkTheme()
+    ThemeMode.Light -> false
+    ThemeMode.Dark -> true
 }

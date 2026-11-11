@@ -34,7 +34,13 @@ import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.ArrowBack
 import androidx.compose.material.icons.automirrored.filled.Send
 import androidx.compose.material.icons.filled.AttachFile
+import androidx.compose.material.icons.automirrored.filled.Reply
+import androidx.compose.material.icons.filled.Close
 import androidx.compose.material.icons.filled.Delete
+import androidx.compose.material.icons.filled.Edit
+import androidx.compose.material.icons.filled.MoreVert
+import androidx.compose.material.icons.filled.NotificationsActive
+import androidx.compose.material.icons.filled.NotificationsOff
 import androidx.compose.material.icons.filled.Description
 import androidx.compose.material.icons.filled.Mic
 import androidx.compose.material.icons.filled.PhotoLibrary
@@ -60,19 +66,30 @@ import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.runtime.setValue
+import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.snapshotFlow
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.alpha
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.platform.LocalClipboardManager
 import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.text.AnnotatedString
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.core.content.ContextCompat
 import dev.example.tg.data.Media
+import dev.example.tg.data.UiMsg
+import kotlinx.coroutines.launch
 import java.time.LocalDate
+
+/** Что сейчас «прикреплено» к полю ввода: ответ или редактирование. */
+sealed interface Composing {
+    class Reply(val msg: UiMsg) : Composing
+    class Edit(val msg: UiMsg) : Composing
+}
 
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
@@ -86,6 +103,13 @@ fun ChatScreen(chatId: Long) {
     val chat = chats.firstOrNull { it.id == chatId }
     val title = chat?.title ?: ""
     var viewer by remember { mutableStateOf<Media?>(null) }
+    var menuFor by remember { mutableStateOf<UiMsg?>(null) }
+    var deleteFor by remember { mutableStateOf<UiMsg?>(null) }
+    var forwardFor by remember { mutableStateOf<UiMsg?>(null) }
+    var composing by remember { mutableStateOf<Composing?>(null) }
+    var topMenu by remember { mutableStateOf(false) }
+    val clipboard = LocalClipboardManager.current
+    val uiScope = rememberCoroutineScope()
     val listState = rememberLazyListState()
     // reverseLayout: индекс 0 — самое новое, подгрузка старых не сдвигает прокрутку
     val reversed = remember(msgs) { msgs.asReversed() }
@@ -122,6 +146,21 @@ fun ChatScreen(chatId: Long) {
             navigationIcon = {
                 IconButton({ repo.close() }) { Icon(Icons.AutoMirrored.Filled.ArrowBack, "Назад") }
             },
+            actions = {
+                Box {
+                    IconButton({ topMenu = true }) { Icon(Icons.Filled.MoreVert, "Меню") }
+                    DropdownMenu(expanded = topMenu, onDismissRequest = { topMenu = false }) {
+                        val muted = chat?.muted == true
+                        DropdownMenuItem(
+                            text = { Text(if (muted) "Включить уведомления" else "Отключить уведомления") },
+                            leadingIcon = {
+                                Icon(if (muted) Icons.Filled.NotificationsActive else Icons.Filled.NotificationsOff, null)
+                            },
+                            onClick = { topMenu = false; repo.setMuted(chatId, !muted) },
+                        )
+                    }
+                }
+            },
         )
         if (preparing) LinearProgressIndicator(Modifier.fillMaxWidth())
 
@@ -136,15 +175,48 @@ fun ChatScreen(chatId: Long) {
                 val older = reversed.getOrNull(i + 1)
                 Column {
                     if (older == null || dayOf(older.time) != dayOf(m.time)) DaySeparator(dayOf(m.time))
-                    MessageItem(m, onOpen = { viewer = it })
+                    MessageItem(
+                        m,
+                        onOpen = { viewer = it },
+                        onLong = { menuFor = m },
+                        onJump = { id ->
+                            val idx = reversed.indexOfFirst { it.id == id }
+                            if (idx >= 0) uiScope.launch { listState.animateScrollToItem(idx) }
+                        },
+                    )
                 }
             }
         }
 
-        InputBar(Modifier.navigationBarsPadding())
+        InputBar(
+            composing = composing,
+            onComposingChange = { composing = it },
+            modifier = Modifier.navigationBarsPadding(),
+        )
     }
 
     viewer?.let { MediaViewer(it) { viewer = null } }
+
+    menuFor?.let { m ->
+        MessageActionsSheet(
+            m = m,
+            onReply = { composing = Composing.Reply(m) },
+            onCopy = { clipboard.setText(AnnotatedString(m.text)) },
+            onEdit = { composing = Composing.Edit(m) },
+            onForward = { forwardFor = m },
+            onDelete = { deleteFor = m },
+            onDismiss = { menuFor = null },
+        )
+    }
+    deleteFor?.let { m ->
+        DeleteDialog(
+            m = m,
+            canRevoke = m.out || chat?.isPrivate == true,
+            onConfirm = { forAll -> repo.delete(m, forAll); deleteFor = null },
+            onDismiss = { deleteFor = null },
+        )
+    }
+    forwardFor?.let { m -> ForwardSheet(m) { forwardFor = null } }
 }
 
 @Composable
@@ -169,7 +241,7 @@ private fun PulsingDot() {
 }
 
 @Composable
-private fun InputBar(modifier: Modifier = Modifier) {
+private fun InputBar(composing: Composing?, onComposingChange: (Composing?) -> Unit, modifier: Modifier = Modifier) {
     val repo = LocalRepo.current
     val recorder = LocalRecorder.current
     val player = LocalPlayer.current
@@ -188,6 +260,16 @@ private fun InputBar(modifier: Modifier = Modifier) {
         repo.sendUris(uris, asFile = true)
     }
 
+    // при входе в режим редактирования подставляем старый текст
+    LaunchedEffect(composing) {
+        (composing as? Composing.Edit)?.let { text = it.msg.text }
+    }
+
+    fun cancelComposing() {
+        if (composing is Composing.Edit) text = ""
+        onComposingChange(null)
+    }
+
     fun startRecording() {
         player.stop()
         if (!recorder.start()) repo.error.value = "Не удалось начать запись"
@@ -202,8 +284,29 @@ private fun InputBar(modifier: Modifier = Modifier) {
         if (ok) startRecording() else micPermission.launch(Manifest.permission.RECORD_AUDIO)
     }
 
+    Column(modifier) {
+    if (composing != null && !recording) {
+        val (icon, title, msg) = when (composing) {
+            is Composing.Reply -> Triple(Icons.AutoMirrored.Filled.Reply, "Ответ", composing.msg)
+            is Composing.Edit -> Triple(Icons.Filled.Edit, "Редактирование", composing.msg)
+        }
+        Surface(Modifier.fillMaxWidth(), color = cs.surfaceContainerLow) {
+            Row(Modifier.padding(start = 16.dp, end = 4.dp, top = 4.dp, bottom = 4.dp), verticalAlignment = Alignment.CenterVertically) {
+                Icon(icon, null, tint = cs.primary)
+                Spacer(Modifier.width(12.dp))
+                Column(Modifier.weight(1f)) {
+                    Text(title, style = MaterialTheme.typography.labelLarge, color = cs.primary, fontWeight = FontWeight.Bold)
+                    Text(
+                        msg.text.ifBlank { mediaLabel(msg.media) },
+                        style = MaterialTheme.typography.bodySmall, maxLines = 1, overflow = TextOverflow.Ellipsis,
+                    )
+                }
+                IconButton({ cancelComposing() }) { Icon(Icons.Filled.Close, "Отмена") }
+            }
+        }
+    }
     Row(
-        modifier.fillMaxWidth().padding(8.dp),
+        Modifier.fillMaxWidth().padding(8.dp),
         verticalAlignment = Alignment.Bottom,
         horizontalArrangement = Arrangement.spacedBy(8.dp),
     ) {
@@ -273,8 +376,20 @@ private fun InputBar(modifier: Modifier = Modifier) {
         FilledIconButton(
             onClick = {
                 when {
-                    recording -> recorder.stop()?.let { repo.sendVoice(it.path, it.durationSec, it.waveform) }
-                    text.isNotBlank() -> { repo.send(text); text = "" }
+                    recording -> {
+                        val replyId = (composing as? Composing.Reply)?.msg?.id ?: 0L
+                        recorder.stop()?.let { repo.sendVoice(it.path, it.durationSec, it.waveform, replyId) }
+                        onComposingChange(null)
+                    }
+                    text.isNotBlank() -> {
+                        when (val c = composing) {
+                            is Composing.Edit -> repo.edit(c.msg, text)
+                            is Composing.Reply -> repo.send(text, c.msg.id)
+                            null -> repo.send(text)
+                        }
+                        text = ""
+                        onComposingChange(null)
+                    }
                     else -> onMic()
                 }
             },
@@ -285,5 +400,6 @@ private fun InputBar(modifier: Modifier = Modifier) {
                 contentDescription = if (canSend) "Отправить" else "Записать голосовое",
             )
         }
+    }
     }
 }
