@@ -136,4 +136,23 @@ object Attachments {
             r.release()
         }
     }
+
+    class VideoInfo(val width: Int, val height: Int, val durationSec: Int)
+
+    /** Размеры и длительность готового видеофайла (для кружков). */
+    fun videoInfo(path: String): VideoInfo {
+        val r = MediaMetadataRetriever()
+        try {
+            r.setDataSource(path)
+            fun num(key: Int): Long = r.extractMetadata(key)?.toLongOrNull() ?: 0L
+            var w = num(MediaMetadataRetriever.METADATA_KEY_VIDEO_WIDTH).toInt()
+            var h = num(MediaMetadataRetriever.METADATA_KEY_VIDEO_HEIGHT).toInt()
+            val rot = num(MediaMetadataRetriever.METADATA_KEY_VIDEO_ROTATION).toInt()
+            if (rot == 90 || rot == 270) { val t = w; w = h; h = t }
+            val dur = ((num(MediaMetadataRetriever.METADATA_KEY_DURATION) + 500) / 1000).toInt()
+            return VideoInfo(w, h, dur)
+        } finally {
+            r.release()
+        }
+    }
 }

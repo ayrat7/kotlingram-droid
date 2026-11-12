@@ -13,6 +13,7 @@ import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.distinctUntilChanged
 import kotlinx.coroutines.flow.map
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.suspendCancellableCoroutine
@@ -63,6 +64,20 @@ class TgRepo(private val app: Context, val settings: AppSettings) {
     val info = MutableStateFlow<String?>(null)
     /** Чат, который нужно открыть (из уведомления). */
     val pendingOpen = MutableStateFlow<Long?>(null)
+
+    /** Подсказки шага «код» и «пароль» при входе. */
+    val codeInfo = MutableStateFlow<CodeInfo?>(null)
+    val passwordHint = MutableStateFlow("")
+
+    /** «В сети / был(а)…» по id пользователя. */
+    val presence = MutableStateFlow<Map<Long, Presence>>(emptyMap())
+    /** «Печатает…» по id чата. */
+    val typing = MutableStateFlow<Map<Long, String>>(emptyMap())
+    private val typingStamp = ConcurrentHashMap<Long, Long>()
+
+    /** Открытый чужой профиль. */
+    val viewedUserId = MutableStateFlow<Long?>(null)
+    val viewedUser = MutableStateFlow<UserCard?>(null)
 
     // ---------- Запуск и ключи ----------
 
@@ -128,6 +143,8 @@ class TgRepo(private val app: Context, val settings: AppSettings) {
 
     // ---------- Авторизация ----------
 
+    fun resendCode() = authCall(TdApi.ResendAuthenticationCode())
+
     fun submitPhone(phone: String) = authCall(TdApi.SetAuthenticationPhoneNumber().apply { phoneNumber = phone.trim() })
     fun submitCode(value: String) = authCall(TdApi.CheckAuthenticationCode().apply { code = value.trim() })
     fun submitPassword(value: String) = authCall(TdApi.CheckAuthenticationPassword().apply { password = value })
@@ -162,7 +179,7 @@ class TgRepo(private val app: Context, val settings: AppSettings) {
                     systemLanguageCode = Locale.getDefault().language
                     deviceModel = Build.MODEL
                     systemVersion = Build.VERSION.RELEASE
-                    applicationVersion = "2.0"
+                    applicationVersion = "2.1"
                 }
                 client?.send(p) { r -> if (r is TdApi.Error) error.value = "Ошибка параметров TDLib: ${r.message}" }
             }
@@ -172,8 +189,14 @@ class TgRepo(private val app: Context, val settings: AppSettings) {
                 notifier.cancelAll()
                 auth.value = Auth.NeedPhone
             }
-            is TdApi.AuthorizationStateWaitCode -> auth.value = Auth.NeedCode
-            is TdApi.AuthorizationStateWaitPassword -> auth.value = Auth.NeedPassword
+            is TdApi.AuthorizationStateWaitCode -> {
+                codeInfo.value = toCodeInfo(s.codeInfo)
+                auth.value = Auth.NeedCode
+            }
+            is TdApi.AuthorizationStateWaitPassword -> {
+                passwordHint.value = s.passwordHint.orEmpty()
+                auth.value = Auth.NeedPassword
+            }
             is TdApi.AuthorizationStateReady -> {
                 prefs.edit().putBoolean("logged_in", true).apply()
                 auth.value = Auth.Ready
@@ -202,6 +225,28 @@ class TgRepo(private val app: Context, val settings: AppSettings) {
             }
             else -> error.value = "Этот способ входа пока не поддерживается (${s.javaClass.simpleName})"
         }
+    }
+
+    private fun toCodeInfo(i: TdApi.AuthenticationCodeInfo): CodeInfo {
+        var length = 0
+        val hint = when (val t = i.type) {
+            is TdApi.AuthenticationCodeTypeTelegramMessage -> {
+                length = t.length
+                "Мы отправили код в приложение Telegram на другом вашем устройстве."
+            }
+            is TdApi.AuthenticationCodeTypeSms -> {
+                length = t.length
+                "Мы отправили код по SMS на ваш номер."
+            }
+            is TdApi.AuthenticationCodeTypeCall -> {
+                length = t.length
+                "Вам позвонят и продиктуют код."
+            }
+            is TdApi.AuthenticationCodeTypeFlashCall, is TdApi.AuthenticationCodeTypeMissedCall ->
+                "Мы позвоним на ваш номер. Введите последние цифры номера, с которого звонили."
+            else -> "Введите код, который мы вам отправили."
+        }
+        return CodeInfo(i.phoneNumber.orEmpty(), hint, length, i.nextType != null, i.timeout, System.nanoTime())
     }
 
     // ---------- Файлы ----------
@@ -258,22 +303,38 @@ class TgRepo(private val app: Context, val settings: AppSettings) {
     private fun mainOrder(c: TdApi.Chat): Long =
         c.positions?.firstOrNull { it.list is TdApi.ChatListMain }?.order ?: 0L
 
+    private fun toItem(c: TdApi.Chat): ChatItem {
+        val t = c.type
+        return ChatItem(
+            id = c.id,
+            title = c.title.ifBlank { "Без названия" },
+            preview = c.lastMessage?.let { m -> (if (m.isOutgoing) "Вы: " else "") + describe(m.content) } ?: "",
+            unread = c.unreadCount,
+            time = c.lastMessage?.date ?: 0,
+            avatar = c.photo?.small?.id,
+            muted = isMuted(c),
+            isPrivate = t is TdApi.ChatTypePrivate,
+            pinned = c.positions?.firstOrNull { it.list is TdApi.ChatListMain }?.isPinned == true,
+            userId = (t as? TdApi.ChatTypePrivate)?.userId ?: 0L,
+        )
+    }
+
+    /** Чат, даже если его нет в основном списке (например, открыт из профиля). */
+    fun chatItem(id: Long): ChatItem? = chatMap[id]?.let { toItem(it) }
+
     private fun publishChats() {
         chats.value = chatMap.values
             .filter { mainOrder(it) > 0 }
             .sortedByDescending { mainOrder(it) }
-            .map { c ->
-                ChatItem(
-                    id = c.id,
-                    title = c.title.ifBlank { "Без названия" },
-                    preview = c.lastMessage?.let { m -> (if (m.isOutgoing) "Вы: " else "") + describe(m.content) } ?: "",
-                    unread = c.unreadCount,
-                    time = c.lastMessage?.date ?: 0,
-                    avatar = c.photo?.small?.id,
-                    muted = isMuted(c),
-                    isPrivate = c.type is TdApi.ChatTypePrivate,
-                )
-            }
+            .map { toItem(it) }
+    }
+
+    fun togglePin(cid: Long, pin: Boolean) {
+        client?.send(TdApi.ToggleChatIsPinned().apply {
+            chatList = TdApi.ChatListMain()
+            chatId = cid
+            isPinned = pin
+        }) { r -> if (r is TdApi.Error) error.value = "Не удалось ${if (pin) "закрепить" else "открепить"} чат: ${r.message}" }
     }
 
     // ---------- Переписка ----------
@@ -401,6 +462,18 @@ class TgRepo(private val app: Context, val settings: AppSettings) {
         }, replyId)
     }
 
+    /** Видеосообщение-кружок. length — сторона квадрата в пикселях (до 640). */
+    fun sendVideoNote(path: String, durationSec: Int, length: Int, replyId: Long = 0L) {
+        val cid = currentChatId
+        if (cid == 0L) return
+        sendContent(cid, TdApi.InputMessageVideoNote().apply {
+            videoNote = local(path)
+            thumbnail = null
+            duration = durationSec
+            this.length = length.coerceIn(1, 640)
+        }, replyId)
+    }
+
     /** Фото/видео из галереи (asFile = false) или любые файлы как документы (asFile = true). */
     fun sendUris(uris: List<Uri>, asFile: Boolean) {
         val cid = currentChatId
@@ -504,11 +577,48 @@ class TgRepo(private val app: Context, val settings: AppSettings) {
                 is TdApi.ConnectionStateUpdating -> "Обновление…"
                 else -> "Подключение…"
             }
-            is TdApi.UpdateUser -> if (u.user.id == myId) {
-                me.value = toProfile(u.user, me.value?.bio.orEmpty())
+            is TdApi.UpdateUser -> {
+                setPresence(u.user.id, toPresence(u.user))
+                if (u.user.id == myId) {
+                    me.value = toProfile(u.user, me.value?.bio.orEmpty())
+                }
+                viewedUser.update { cur ->
+                    if (cur != null && cur.id == u.user.id) toCard(u.user, cur.bio) else cur
+                }
             }
-            is TdApi.UpdateUserFullInfo -> if (u.userId == myId) {
-                me.value = me.value?.copy(bio = u.userFullInfo.bio?.text.orEmpty())
+            is TdApi.UpdateUserStatus -> {
+                val prev = presence.value[u.userId]
+                if (prev?.kind != PresenceKind.Bot) setPresence(u.userId, toPresence(u.status))
+                viewedUser.update { cur ->
+                    if (cur != null && cur.id == u.userId && cur.presence.kind != PresenceKind.Bot) {
+                        cur.copy(presence = toPresence(u.status))
+                    } else cur
+                }
+            }
+            is TdApi.UpdateUserFullInfo -> {
+                if (u.userId == myId) {
+                    me.value = me.value?.copy(bio = u.userFullInfo.bio?.text.orEmpty())
+                }
+                viewedUser.update { cur ->
+                    if (cur != null && cur.id == u.userId) cur.copy(bio = u.userFullInfo.bio?.text.orEmpty()) else cur
+                }
+            }
+            is TdApi.UpdateChatAction -> {
+                val uid = (u.senderId as? TdApi.MessageSenderUser)?.userId ?: 0L
+                if (uid != myId) {
+                    val label = when (u.action) {
+                        is TdApi.ChatActionTyping -> "печатает…"
+                        is TdApi.ChatActionRecordingVoiceNote -> "записывает голосовое…"
+                        is TdApi.ChatActionRecordingVideoNote -> "записывает кружок…"
+                        is TdApi.ChatActionUploadingPhoto, is TdApi.ChatActionUploadingVideo,
+                        is TdApi.ChatActionUploadingDocument, is TdApi.ChatActionUploadingVideoNote,
+                        is TdApi.ChatActionUploadingVoiceNote -> "отправляет файл…"
+                        else -> null
+                    }
+                    val isPrivateChat = chatMap[u.chatId]?.type is TdApi.ChatTypePrivate
+                    val who = if (isPrivateChat) null else userNames[uid]
+                    setTyping(u.chatId, label?.let { if (who != null) "$who $it" else it })
+                }
             }
             is TdApi.UpdateChatNotificationSettings -> chatMap[u.chatId]?.let {
                 it.notificationSettings = u.notificationSettings
@@ -790,6 +900,103 @@ class TgRepo(private val app: Context, val settings: AppSettings) {
         }
     }
 
+    // ---------- Статусы ----------
+
+    private fun toPresence(s: TdApi.UserStatus?): Presence = when (s) {
+        is TdApi.UserStatusOnline -> Presence(PresenceKind.Online)
+        is TdApi.UserStatusOffline -> Presence(PresenceKind.Offline, s.wasOnline)
+        is TdApi.UserStatusRecently -> Presence(PresenceKind.Recently)
+        is TdApi.UserStatusLastWeek -> Presence(PresenceKind.LastWeek)
+        is TdApi.UserStatusLastMonth -> Presence(PresenceKind.LastMonth)
+        else -> Presence(PresenceKind.Unknown)
+    }
+
+    private fun toPresence(u: TdApi.User): Presence =
+        if (u.type is TdApi.UserTypeBot) Presence(PresenceKind.Bot) else toPresence(u.status)
+
+    private fun setPresence(id: Long, p: Presence) {
+        presence.update { m -> if (m[id] == p) m else m + (id to p) }
+    }
+
+    private fun setTyping(cid: Long, label: String?) {
+        if (label == null) {
+            typingStamp.remove(cid)
+            typing.update { it - cid }
+            return
+        }
+        val stamp = System.nanoTime()
+        typingStamp[cid] = stamp
+        typing.update { it + (cid to label) }
+        // клиенты шлют «печатает» раз в несколько секунд — без обновления гасим сами
+        scope.launch {
+            delay(6000)
+            if (typingStamp[cid] == stamp) {
+                typingStamp.remove(cid)
+                typing.update { it - cid }
+            }
+        }
+    }
+
+    // ---------- Чужие профили ----------
+
+    private fun toCard(u: TdApi.User, bio: String): UserCard {
+        reg(u.profilePhoto?.small)
+        reg(u.profilePhoto?.big)
+        val chatId = chatMap.values.firstOrNull { (it.type as? TdApi.ChatTypePrivate)?.userId == u.id }?.id ?: 0L
+        return UserCard(
+            id = u.id,
+            name = "${u.firstName} ${u.lastName}".trim(),
+            username = u.usernames?.activeUsernames?.firstOrNull().orEmpty(),
+            phone = u.phoneNumber.orEmpty(),
+            bio = bio,
+            presence = toPresence(u),
+            avatarSmall = u.profilePhoto?.small?.id,
+            avatarBig = u.profilePhoto?.big?.id,
+            isContact = u.isContact,
+            isBot = u.type is TdApi.UserTypeBot,
+            premium = u.isPremium,
+            chatId = chatId,
+        )
+    }
+
+    fun openUser(userId: Long) {
+        if (userId == 0L) return
+        viewedUserId.value = userId
+        viewedUser.value = null
+        scope.launch {
+            try {
+                val u = call(TdApi.GetUser().apply { this.userId = userId }) as TdApi.User
+                if (viewedUserId.value == userId) viewedUser.value = toCard(u, "")
+                runCatching {
+                    val full = call(TdApi.GetUserFullInfo().apply { this.userId = userId }) as TdApi.UserFullInfo
+                    val bio = full.bio?.text.orEmpty()
+                    viewedUser.update { cur -> if (cur != null && cur.id == userId) cur.copy(bio = bio) else cur }
+                }
+            } catch (e: Exception) {
+                error.value = "Не удалось открыть профиль: ${e.message}"
+                if (viewedUserId.value == userId) closeUser()
+            }
+        }
+    }
+
+    fun closeUser() {
+        viewedUserId.value = null
+    }
+
+    /** «Написать» из чужого профиля. */
+    fun openPrivateChat(userId: Long) {
+        scope.launch {
+            try {
+                val chat = call(TdApi.CreatePrivateChat().apply { this.userId = userId; force = false }) as TdApi.Chat
+                chatMap.putIfAbsent(chat.id, chat)
+                closeUser()
+                if (currentChatId != chat.id) open(chat.id)
+            } catch (e: Exception) {
+                error.value = "Не удалось открыть чат: ${e.message}"
+            }
+        }
+    }
+
     // ---------- Хелперы ----------
 
     private suspend fun call(f: TdApi.Function<*>): TdApi.Object = suspendCancellableCoroutine { cont ->
@@ -819,6 +1026,7 @@ class TgRepo(private val app: Context, val settings: AppSettings) {
             read = m.isOutgoing && chat != null && m.id <= chat.lastReadOutboxMessageId,
             edited = m.editDate > 0,
             reply = replyPreview(m),
+            senderId = (m.senderId as? TdApi.MessageSenderUser)?.userId ?: 0L,
         )
     }
 

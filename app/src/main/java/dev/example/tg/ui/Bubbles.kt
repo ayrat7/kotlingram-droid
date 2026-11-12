@@ -7,7 +7,32 @@ import androidx.compose.foundation.background
 import androidx.compose.foundation.ExperimentalFoundationApi
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.combinedClickable
+import androidx.compose.foundation.gestures.detectHorizontalDragGestures
 import androidx.compose.foundation.gestures.detectTapGestures
+import androidx.compose.animation.core.Animatable
+import androidx.compose.foundation.layout.offset
+import androidx.compose.material.icons.automirrored.filled.Reply
+import androidx.compose.runtime.DisposableEffect
+import androidx.compose.runtime.LaunchedEffect
+import androidx.compose.runtime.Stable
+import androidx.compose.runtime.mutableFloatStateOf
+import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.rememberCoroutineScope
+import androidx.compose.runtime.setValue
+import androidx.compose.ui.graphics.StrokeCap
+import androidx.compose.ui.graphics.drawscope.Stroke
+import androidx.compose.ui.graphics.graphicsLayer
+import androidx.compose.ui.platform.LocalDensity
+import androidx.compose.ui.unit.IntOffset
+import androidx.compose.ui.viewinterop.AndroidView
+import android.net.Uri
+import android.view.TextureView
+import androidx.media3.common.MediaItem
+import androidx.media3.common.Player
+import androidx.media3.exoplayer.ExoPlayer
+import kotlinx.coroutines.delay
+import kotlinx.coroutines.launch
+import kotlin.math.roundToInt
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.BoxScope
@@ -69,25 +94,87 @@ import dev.example.tg.data.UiMsg
 import dev.example.tg.media.Waveform
 import java.io.File
 
+/** Состояние встроенного проигрывателя кружков: одновременно играет не больше одного. */
+@Stable
+class RoundState {
+    var id by mutableStateOf<Long?>(null)
+    var paused by mutableStateOf(false)
+    var progress by mutableFloatStateOf(0f)
+
+    fun tap(msgId: Long) {
+        if (id == msgId) {
+            paused = !paused
+        } else {
+            id = msgId
+            paused = false
+            progress = 0f
+        }
+    }
+
+    fun stop() {
+        id = null
+        paused = false
+        progress = 0f
+    }
+}
+
 @OptIn(ExperimentalFoundationApi::class)
 @Composable
-fun MessageItem(m: UiMsg, onOpen: (Media) -> Unit, onLong: () -> Unit, onJump: (Long) -> Unit) {
+fun MessageItem(
+    m: UiMsg,
+    round: RoundState,
+    onOpen: (Media) -> Unit,
+    onLong: () -> Unit,
+    onJump: (Long) -> Unit,
+    onReply: () -> Unit,
+    onProfile: (Long) -> Unit,
+) {
     val media = m.media
+    val cs = MaterialTheme.colorScheme
+    val offset = remember { Animatable(0f) }
+    val scope = rememberCoroutineScope()
+    val limit = with(LocalDensity.current) { 72.dp.toPx() }
+    val reply by rememberUpdatedState(onReply)
+
     Box(
-        Modifier.fillMaxWidth().padding(horizontal = 8.dp),
-        contentAlignment = if (m.out) Alignment.CenterEnd else Alignment.CenterStart,
+        Modifier.fillMaxWidth().pointerInput(m.id) {
+            // свайп влево по сообщению — ответить, как в Telegram
+            detectHorizontalDragGestures(
+                onDragEnd = {
+                    if (offset.value <= -limit * 0.8f) reply()
+                    scope.launch { offset.animateTo(0f) }
+                },
+                onDragCancel = { scope.launch { offset.animateTo(0f) } },
+            ) { change, dx ->
+                change.consume()
+                scope.launch { offset.snapTo((offset.value + dx).coerceIn(-limit, 0f)) }
+            }
+        },
     ) {
-        when {
-            media is Media.Sticker -> StickerMessage(m, media, onLong)
-            media is Media.Video && media.round -> RoundVideoMessage(m, media, onOpen, onLong)
-            else -> Bubble(m, onOpen, onLong, onJump)
+        Box(
+            Modifier.align(Alignment.CenterEnd).padding(end = 16.dp).size(32.dp).clip(CircleShape)
+                .background(cs.surfaceContainerHighest)
+                .graphicsLayer { alpha = (-offset.value / limit).coerceIn(0f, 1f) },
+            contentAlignment = Alignment.Center,
+        ) {
+            Icon(Icons.AutoMirrored.Filled.Reply, null, Modifier.size(18.dp), tint = cs.primary)
+        }
+        Box(
+            Modifier.fillMaxWidth().padding(horizontal = 8.dp).offset { IntOffset(offset.value.roundToInt(), 0) },
+            contentAlignment = if (m.out) Alignment.CenterEnd else Alignment.CenterStart,
+        ) {
+            when {
+                media is Media.Sticker -> StickerMessage(m, media, onLong)
+                media is Media.Video && media.round -> RoundVideoMessage(m, media, round, onLong)
+                else -> Bubble(m, onOpen, onLong, onJump, onProfile)
+            }
         }
     }
 }
 
 @OptIn(ExperimentalFoundationApi::class)
 @Composable
-private fun Bubble(m: UiMsg, onOpen: (Media) -> Unit, onLong: () -> Unit, onJump: (Long) -> Unit) {
+private fun Bubble(m: UiMsg, onOpen: (Media) -> Unit, onLong: () -> Unit, onJump: (Long) -> Unit, onProfile: (Long) -> Unit) {
     val cs = MaterialTheme.colorScheme
     val media = m.media
     val visual = media is Media.Photo || media is Media.Video
@@ -109,7 +196,9 @@ private fun Bubble(m: UiMsg, onOpen: (Media) -> Unit, onLong: () -> Unit, onJump
             if (!m.out && m.from.isNotBlank()) {
                 Text(
                     m.from, style = MaterialTheme.typography.labelLarge, color = cs.primary,
-                    modifier = Modifier.padding(start = 12.dp, end = 12.dp, top = 8.dp, bottom = if (visual) 6.dp else 0.dp),
+                    modifier = Modifier
+                        .clickable(enabled = m.senderId != 0L) { onProfile(m.senderId) }
+                        .padding(start = 12.dp, end = 12.dp, top = 8.dp, bottom = if (visual) 6.dp else 0.dp),
                 )
             }
             m.reply?.let { ReplyBlock(it) { onJump(it.id) } }
@@ -280,15 +369,89 @@ private fun VideoContent(v: Media.Video, onClick: () -> Unit, onLong: () -> Unit
     }
 }
 
+/** Кружок проигрывается прямо в кружке (не на весь экран): тап — играть/пауза, кольцо — прогресс. */
 @OptIn(ExperimentalFoundationApi::class)
 @Composable
-private fun RoundVideoMessage(m: UiMsg, v: Media.Video, onOpen: (Media) -> Unit, onLong: () -> Unit) {
-    Box(Modifier.size(200.dp).clip(CircleShape).combinedClickable(onClick = { onOpen(v) }, onLongClick = onLong)) {
-        VideoThumb(v, Modifier.fillMaxSize())
-        PlayOverlay(v.file)
-        DurationChip(v, Modifier.align(Alignment.TopCenter).padding(top = 10.dp))
-        MetaPill(m, Modifier.align(Alignment.BottomCenter).padding(bottom = 12.dp))
+private fun RoundVideoMessage(m: UiMsg, v: Media.Video, round: RoundState, onLong: () -> Unit) {
+    val repo = LocalRepo.current
+    val player = LocalPlayer.current
+    val f = rememberFile(v.file, auto = false)
+    val path = f?.path
+    val active = round.id == m.id
+    val ring = MaterialTheme.colorScheme.primary
+
+    DisposableEffect(m.id) { onDispose { if (round.id == m.id) round.stop() } }
+
+    Box(Modifier.size(200.dp)) {
+        Box(
+            Modifier.fillMaxSize().clip(CircleShape).combinedClickable(
+                onClick = {
+                    if (path == null) {
+                        repo.download(v.file)
+                    } else {
+                        player.pause()
+                        if (round.id != m.id && !m.out) repo.markOpened(m.chatId, m.id)
+                        round.tap(m.id)
+                    }
+                },
+                onLongClick = onLong,
+            ),
+        ) {
+            VideoThumb(v, Modifier.fillMaxSize())
+            if (active && path != null) RoundPlayer(path, round)
+            if (!active || round.paused) PlayOverlay(v.file)
+            DurationChip(v, Modifier.align(Alignment.TopCenter).padding(top = 10.dp))
+            MetaPill(m, Modifier.align(Alignment.BottomCenter).padding(bottom = 12.dp))
+        }
+        if (active) {
+            Canvas(Modifier.fillMaxSize()) {
+                val w = 3.dp.toPx()
+                drawArc(
+                    ring, -90f, 360f * round.progress, false,
+                    topLeft = Offset(w / 2, w / 2),
+                    size = Size(size.width - w, size.height - w),
+                    style = Stroke(w, cap = StrokeCap.Round),
+                )
+            }
+        }
     }
+}
+
+@Composable
+private fun RoundPlayer(path: String, round: RoundState) {
+    val ctx = LocalContext.current
+    val exo = remember(path) {
+        ExoPlayer.Builder(ctx).build().apply {
+            setMediaItem(MediaItem.fromUri(Uri.fromFile(File(path))))
+            prepare()
+            playWhenReady = true
+        }
+    }
+    DisposableEffect(exo) {
+        val l = object : Player.Listener {
+            override fun onPlaybackStateChanged(state: Int) {
+                if (state == Player.STATE_ENDED) round.stop()
+            }
+        }
+        exo.addListener(l)
+        onDispose {
+            exo.removeListener(l)
+            exo.release()
+        }
+    }
+    LaunchedEffect(exo, round.paused) { exo.playWhenReady = !round.paused }
+    LaunchedEffect(exo) {
+        while (true) {
+            val d = exo.duration
+            if (d > 0) round.progress = (exo.currentPosition.toFloat() / d).coerceIn(0f, 1f)
+            delay(50)
+        }
+    }
+    // TextureView, а не SurfaceView — только он честно обрезается в круг
+    AndroidView(
+        factory = { c -> TextureView(c).also { exo.setVideoTextureView(it) } },
+        modifier = Modifier.fillMaxSize(),
+    )
 }
 
 @OptIn(ExperimentalFoundationApi::class)

@@ -83,6 +83,14 @@ import androidx.core.content.ContextCompat
 import dev.example.tg.data.Media
 import dev.example.tg.data.UiMsg
 import kotlinx.coroutines.launch
+import androidx.compose.animation.AnimatedVisibility
+import androidx.compose.foundation.clickable
+import androidx.compose.foundation.layout.Column
+import androidx.compose.material.icons.filled.KeyboardArrowDown
+import androidx.compose.material.icons.filled.Videocam
+import androidx.compose.material3.SmallFloatingActionButton
+import androidx.compose.runtime.derivedStateOf
+import dev.example.tg.data.PresenceKind
 import java.time.LocalDate
 
 /** Что сейчас «прикреплено» к полю ввода: ответ или редактирование. */
@@ -100,7 +108,12 @@ fun ChatScreen(chatId: Long) {
     val msgs by repo.messages.collectAsState()
     val chats by repo.chats.collectAsState()
     val preparing by repo.preparing.collectAsState()
-    val chat = chats.firstOrNull { it.id == chatId }
+    val chat = chats.firstOrNull { it.id == chatId } ?: repo.chatItem(chatId)
+    val typing by repo.typing.collectAsState()
+    val presence by repo.presence.collectAsState()
+    val ps by player.state.collectAsState()
+    val round = remember { RoundState() }
+    val peerId = chat?.userId ?: 0L
     val title = chat?.title ?: ""
     var viewer by remember { mutableStateOf<Media?>(null) }
     var menuFor by remember { mutableStateOf<UiMsg?>(null) }
@@ -118,8 +131,13 @@ fun ChatScreen(chatId: Long) {
         onDispose {
             recorder.cancel()
             player.stop()
+            round.stop()
         }
     }
+
+    // голосовое и кружок не играют одновременно
+    LaunchedEffect(ps.playing) { if (ps.playing) round.stop() }
+    val showDown by remember { derivedStateOf { listState.firstVisibleItemIndex > 2 } }
 
     LaunchedEffect(reversed.firstOrNull()?.id) {
         if (listState.firstVisibleItemIndex <= 1) listState.animateScrollToItem(0)
@@ -137,10 +155,27 @@ fun ChatScreen(chatId: Long) {
     Column(Modifier.fillMaxSize().background(MaterialTheme.colorScheme.surface).imePadding()) {
         TopAppBar(
             title = {
-                Row(verticalAlignment = Alignment.CenterVertically) {
+                Row(
+                    Modifier.clip(RoundedCornerShape(12.dp))
+                        .clickable(enabled = peerId != 0L) { repo.openUser(peerId) },
+                    verticalAlignment = Alignment.CenterVertically,
+                ) {
                     Avatar(chat?.avatar, chatId, title, 40.dp)
                     Spacer(Modifier.width(12.dp))
-                    Text(title, fontWeight = FontWeight.Bold, maxLines = 1, overflow = TextOverflow.Ellipsis)
+                    Column {
+                        Text(title, fontWeight = FontWeight.Bold, maxLines = 1, overflow = TextOverflow.Ellipsis)
+                        val typingLabel = typing[chatId]
+                        val sub = typingLabel ?: if (chat?.isPrivate == true) presenceText(presence[peerId]) else ""
+                        if (sub.isNotEmpty()) {
+                            val online = typingLabel != null || presence[peerId]?.kind == PresenceKind.Online
+                            Text(
+                                sub, style = MaterialTheme.typography.bodySmall, maxLines = 1,
+                                overflow = TextOverflow.Ellipsis,
+                                color = if (online) MaterialTheme.colorScheme.primary
+                                else MaterialTheme.colorScheme.onSurfaceVariant,
+                            )
+                        }
+                    }
                 }
             },
             navigationIcon = {
@@ -164,26 +199,39 @@ fun ChatScreen(chatId: Long) {
         )
         if (preparing) LinearProgressIndicator(Modifier.fillMaxWidth())
 
-        LazyColumn(
-            Modifier.weight(1f).fillMaxWidth(),
-            state = listState,
-            reverseLayout = true,
-            contentPadding = PaddingValues(vertical = 8.dp),
-            verticalArrangement = Arrangement.spacedBy(4.dp),
-        ) {
-            itemsIndexed(reversed, key = { _, m -> m.id }) { i, m ->
-                val older = reversed.getOrNull(i + 1)
-                Column {
-                    if (older == null || dayOf(older.time) != dayOf(m.time)) DaySeparator(dayOf(m.time))
-                    MessageItem(
-                        m,
-                        onOpen = { viewer = it },
-                        onLong = { menuFor = m },
-                        onJump = { id ->
-                            val idx = reversed.indexOfFirst { it.id == id }
-                            if (idx >= 0) uiScope.launch { listState.animateScrollToItem(idx) }
-                        },
-                    )
+        Box(Modifier.weight(1f).fillMaxWidth()) {
+            LazyColumn(
+                Modifier.fillMaxSize(),
+                state = listState,
+                reverseLayout = true,
+                contentPadding = PaddingValues(vertical = 8.dp),
+                verticalArrangement = Arrangement.spacedBy(4.dp),
+            ) {
+                itemsIndexed(reversed, key = { _, m -> m.id }) { i, m ->
+                    val older = reversed.getOrNull(i + 1)
+                    Column {
+                        if (older == null || dayOf(older.time) != dayOf(m.time)) DaySeparator(dayOf(m.time))
+                        MessageItem(
+                            m,
+                            round = round,
+                            onOpen = { viewer = it },
+                            onLong = { menuFor = m },
+                            onJump = { id ->
+                                val idx = reversed.indexOfFirst { it.id == id }
+                                if (idx >= 0) uiScope.launch { listState.animateScrollToItem(idx) }
+                            },
+                            onReply = { composing = Composing.Reply(m) },
+                            onProfile = { repo.openUser(it) },
+                        )
+                    }
+                }
+            }
+            AnimatedVisibility(
+                showDown,
+                modifier = Modifier.align(Alignment.BottomEnd).padding(12.dp),
+            ) {
+                SmallFloatingActionButton(onClick = { uiScope.launch { listState.animateScrollToItem(0) } }) {
+                    Icon(Icons.Filled.KeyboardArrowDown, "Вниз")
                 }
             }
         }
@@ -191,6 +239,7 @@ fun ChatScreen(chatId: Long) {
         InputBar(
             composing = composing,
             onComposingChange = { composing = it },
+            onVideoStart = { round.stop() },
             modifier = Modifier.navigationBarsPadding(),
         )
     }
@@ -241,7 +290,12 @@ private fun PulsingDot() {
 }
 
 @Composable
-private fun InputBar(composing: Composing?, onComposingChange: (Composing?) -> Unit, modifier: Modifier = Modifier) {
+private fun InputBar(
+    composing: Composing?,
+    onComposingChange: (Composing?) -> Unit,
+    onVideoStart: () -> Unit,
+    modifier: Modifier = Modifier,
+) {
     val repo = LocalRepo.current
     val recorder = LocalRecorder.current
     val player = LocalPlayer.current
@@ -277,6 +331,20 @@ private fun InputBar(composing: Composing?, onComposingChange: (Composing?) -> U
 
     val micPermission = rememberLauncherForActivityResult(ActivityResultContracts.RequestPermission()) { granted ->
         if (granted) startRecording() else repo.error.value = "Нет доступа к микрофону"
+    }
+
+    var videoOpen by remember { mutableStateOf(false) }
+    fun openVideo() {
+        player.stop()
+        onVideoStart()
+        videoOpen = true
+    }
+    val videoPermissions = rememberLauncherForActivityResult(ActivityResultContracts.RequestMultiplePermissions()) { r ->
+        if (r.values.all { it }) openVideo() else repo.error.value = "Для видеосообщений нужен доступ к камере и микрофону"
+    }
+    fun onVideo() {
+        if (hasVideoNotePermissions(ctx)) openVideo()
+        else videoPermissions.launch(arrayOf(Manifest.permission.CAMERA, Manifest.permission.RECORD_AUDIO))
     }
 
     fun onMic() {
@@ -368,6 +436,11 @@ private fun InputBar(composing: Composing?, onComposingChange: (Composing?) -> U
                             disabledIndicatorColor = Color.Transparent,
                         ),
                     )
+                    if (text.isBlank()) {
+                        IconButton({ onVideo() }, Modifier.heightIn(min = 52.dp)) {
+                            Icon(Icons.Filled.Videocam, "Видеосообщение")
+                        }
+                    }
                 }
             }
         }
@@ -400,6 +473,17 @@ private fun InputBar(composing: Composing?, onComposingChange: (Composing?) -> U
                 contentDescription = if (canSend) "Отправить" else "Записать голосовое",
             )
         }
+    }
+    if (videoOpen) {
+        VideoNoteRecorder(
+            onDismiss = { videoOpen = false },
+            onSend = { path, dur, len ->
+                val replyId = (composing as? Composing.Reply)?.msg?.id ?: 0L
+                repo.sendVideoNote(path, dur, len, replyId)
+                onComposingChange(null)
+                videoOpen = false
+            },
+        )
     }
     }
 }

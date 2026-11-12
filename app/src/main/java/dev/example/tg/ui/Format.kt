@@ -6,6 +6,8 @@ import android.content.Intent
 import android.widget.Toast
 import androidx.core.content.FileProvider
 import dev.example.tg.data.Media
+import dev.example.tg.data.Presence
+import dev.example.tg.data.PresenceKind
 import java.io.File
 import java.text.SimpleDateFormat
 import java.time.Instant
@@ -71,4 +73,34 @@ fun mediaLabel(m: Media?): String = when (m) {
     is Media.Doc -> m.name
     is Media.Sticker -> m.emoji + " Стикер"
     null -> ""
+}
+
+private fun lastSeenLabel(t: Int): String {
+    val now = (System.currentTimeMillis() / 1000).toInt()
+    val diff = now - t
+    return when {
+        diff < 60 -> "только что"
+        diff < 3600 -> "${diff / 60} мин. назад"
+        else -> {
+            val d = dayOf(t)
+            val today = LocalDate.now()
+            when {
+                d == today -> "сегодня в ${formatClock(t)}"
+                d == today.minusDays(1) -> "вчера в ${formatClock(t)}"
+                else -> d.format(DateTimeFormatter.ofPattern("d MMM", Locale.getDefault())) + " в " + formatClock(t)
+            }
+        }
+    }
+}
+
+/** «в сети», «был(а) недавно» и т.п. */
+fun presenceText(p: Presence?): String = when (p?.kind) {
+    PresenceKind.Online -> "в сети"
+    PresenceKind.Offline -> "был(а) " + lastSeenLabel(p.lastSeen)
+    PresenceKind.Recently -> "был(а) недавно"
+    PresenceKind.LastWeek -> "был(а) на этой неделе"
+    PresenceKind.LastMonth -> "был(а) в этом месяце"
+    PresenceKind.Long -> "был(а) давно"
+    PresenceKind.Bot -> "бот"
+    else -> ""
 }

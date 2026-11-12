@@ -85,6 +85,9 @@ fun TgRoot() {
     BackHandler(enabled = openId == null && screen != Screen.Chats) {
         screen = Screen.Chats
     }
+    // регистрируется последним, поэтому закрывает чужой профиль раньше, чем чат
+    val viewedUser by repo.viewedUserId.collectAsState()
+    BackHandler(enabled = viewedUser != null) { repo.closeUser() }
 
     LaunchedEffect(error) {
         error?.let {
@@ -129,39 +132,24 @@ fun TgRoot() {
 
     Surface(Modifier.fillMaxSize(), color = MaterialTheme.colorScheme.background) {
         Box(Modifier.fillMaxSize()) {
-            when (auth) {
-                Auth.Starting -> AuthCard("Kotlingram", "Подключение к Telegram…") {
-                    CircularProgressIndicator()
+            if (auth != Auth.Ready) {
+                AuthScreen(auth)
+            } else {
+                val id = openId
+                when {
+                    id != null -> ChatScreen(id)
+                    screen == Screen.Profile -> ProfileScreen(onBack = { screen = Screen.Chats })
+                    screen == Screen.Settings -> SettingsScreen(
+                        onBack = { screen = Screen.Chats },
+                        onProfile = { screen = Screen.Profile },
+                    )
+                    else -> ChatsScreen(
+                        onProfile = { screen = Screen.Profile },
+                        onSettings = { screen = Screen.Settings },
+                    )
                 }
-                Auth.NeedKeys -> KeysScreen()
-                Auth.NeedPhone -> StepScreen(
-                    "Вход в Telegram", "Номер телефона в международном формате", "Телефон", "+79991234567",
-                    false, KeyboardType.Phone, busy, repo::submitPhone,
-                    footer = { TextButton({ repo.resetKeys() }) { Text("Сбросить API ключи") } },
-                )
-                Auth.NeedCode -> StepScreen(
-                    "Код подтверждения", "Код пришёл в Telegram или по SMS", "Код", "12345",
-                    false, KeyboardType.Number, busy, repo::submitCode,
-                )
-                Auth.NeedPassword -> StepScreen(
-                    "Облачный пароль", "Включена двухфакторная защита", "Пароль", "",
-                    true, KeyboardType.Password, busy, repo::submitPassword,
-                )
-                Auth.Ready -> {
-                    val id = openId
-                    when {
-                        id != null -> ChatScreen(id)
-                        screen == Screen.Profile -> ProfileScreen(onBack = { screen = Screen.Chats })
-                        screen == Screen.Settings -> SettingsScreen(
-                            onBack = { screen = Screen.Chats },
-                            onProfile = { screen = Screen.Profile },
-                        )
-                        else -> ChatsScreen(
-                            onProfile = { screen = Screen.Profile },
-                            onSettings = { screen = Screen.Settings },
-                        )
-                    }
-                }
+                // чужой профиль поверх чата — чтобы не терять черновик и положение ленты
+                UserProfileHost()
             }
             SnackbarHost(
                 snackbar,
@@ -179,86 +167,5 @@ fun TgRoot() {
                 }
             }
         }
-    }
-}
-
-@Composable
-private fun AuthCard(title: String, subtitle: String, content: @Composable ColumnScope.() -> Unit) {
-    Column(
-        Modifier.fillMaxSize().systemBarsPadding().imePadding().verticalScroll(rememberScrollState()).padding(20.dp),
-        verticalArrangement = Arrangement.Center,
-        horizontalAlignment = Alignment.CenterHorizontally,
-    ) {
-        ElevatedCard(Modifier.widthIn(max = 420.dp).fillMaxWidth()) {
-            Column(
-                Modifier.padding(24.dp).fillMaxWidth(),
-                horizontalAlignment = Alignment.CenterHorizontally,
-                verticalArrangement = Arrangement.spacedBy(14.dp),
-            ) {
-                Box(
-                    Modifier.size(64.dp).clip(CircleShape).background(MaterialTheme.colorScheme.primaryContainer),
-                    contentAlignment = Alignment.Center,
-                ) {
-                    Icon(
-                        Icons.AutoMirrored.Filled.Send, null,
-                        tint = MaterialTheme.colorScheme.onPrimaryContainer,
-                        modifier = Modifier.size(30.dp),
-                    )
-                }
-                Text(title, style = MaterialTheme.typography.headlineSmall, fontWeight = FontWeight.Bold, textAlign = TextAlign.Center)
-                Text(
-                    subtitle, style = MaterialTheme.typography.bodyMedium,
-                    color = MaterialTheme.colorScheme.onSurfaceVariant, textAlign = TextAlign.Center,
-                )
-                content()
-            }
-        }
-    }
-}
-
-@Composable
-private fun Field(
-    value: String, onChange: (String) -> Unit, label: String, hint: String = "",
-    secret: Boolean = false, kb: KeyboardType = KeyboardType.Text, done: () -> Unit = {},
-) = OutlinedTextField(
-    value = value,
-    onValueChange = onChange,
-    modifier = Modifier.fillMaxWidth(),
-    label = { Text(label) },
-    placeholder = if (hint.isNotEmpty()) ({ Text(hint) }) else null,
-    singleLine = true,
-    visualTransformation = if (secret) PasswordVisualTransformation() else VisualTransformation.None,
-    keyboardOptions = KeyboardOptions(keyboardType = kb, imeAction = ImeAction.Done),
-    keyboardActions = KeyboardActions(onDone = { done() }),
-)
-
-@Composable
-private fun KeysScreen() {
-    val repo = LocalRepo.current
-    var id by rememberSaveable { mutableStateOf("") }
-    var hash by rememberSaveable { mutableStateOf("") }
-    AuthCard("Настройка Telegram API", "Ключи берутся на my.telegram.org → API development tools") {
-        Field(id, { id = it }, "API ID", kb = KeyboardType.Number)
-        Field(hash, { hash = it }, "API Hash", secret = true, done = { repo.saveKeys(id, hash) })
-        Button({ repo.saveKeys(id, hash) }, Modifier.fillMaxWidth().height(50.dp)) { Text("Сохранить и подключиться") }
-    }
-}
-
-@Composable
-private fun StepScreen(
-    title: String, subtitle: String, label: String, hint: String, secret: Boolean, kb: KeyboardType,
-    busy: Boolean, onSubmit: (String) -> Unit, footer: @Composable () -> Unit = {},
-) {
-    var v by rememberSaveable(title) { mutableStateOf("") }
-    AuthCard(title, subtitle) {
-        Field(v, { v = it }, label, hint, secret, kb, done = { if (!busy && v.isNotBlank()) onSubmit(v) })
-        Button(
-            { onSubmit(v) },
-            Modifier.fillMaxWidth().height(50.dp),
-            enabled = !busy && v.isNotBlank(),
-        ) {
-            if (busy) CircularProgressIndicator(Modifier.size(20.dp), strokeWidth = 2.dp) else Text("Продолжить")
-        }
-        footer()
     }
 }

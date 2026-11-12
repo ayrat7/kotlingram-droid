@@ -21,6 +21,9 @@ data class ChatItem(
     val avatar: Int?,
     val muted: Boolean = false,
     val isPrivate: Boolean = false,
+    val pinned: Boolean = false,
+    /** id собеседника в личном чате, иначе 0 */
+    val userId: Long = 0L,
 )
 
 /** Вложение сообщения. Везде хранятся только id файлов TDLib — состояние файла берётся из TgRepo.files. */
@@ -72,6 +75,8 @@ data class UiMsg(
     val read: Boolean = false,
     val edited: Boolean = false,
     val reply: ReplyPreview? = null,
+    /** id отправителя-пользователя (для открытия профиля), 0 если неизвестно */
+    val senderId: Long = 0L,
 )
 
 /** Превью сообщения, на которое отвечает данное. */
@@ -110,3 +115,34 @@ data class FileState(
             return (v.toFloat() / size).coerceIn(0f, 1f)
         }
 }
+
+enum class PresenceKind { Online, Offline, Recently, LastWeek, LastMonth, Long, Bot, Unknown }
+
+/** «Был(а) в сети» пользователя. lastSeen — unix-время, только для Offline. */
+data class Presence(val kind: PresenceKind, val lastSeen: Int = 0)
+
+/** Чужой профиль. */
+data class UserCard(
+    val id: Long,
+    val name: String,
+    val username: String,
+    val phone: String,
+    val bio: String,
+    val presence: Presence,
+    val avatarSmall: Int?,
+    val avatarBig: Int?,
+    val isContact: Boolean,
+    val isBot: Boolean,
+    val premium: Boolean,
+    val chatId: Long,
+)
+
+/** Подсказки для шага ввода кода. */
+data class CodeInfo(
+    val phone: String,
+    val hint: String,
+    val length: Int,
+    val canResend: Boolean,
+    val timeout: Int,
+    val stamp: Long,
+)

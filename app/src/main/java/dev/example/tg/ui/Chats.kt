@@ -59,14 +59,22 @@ import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import kotlinx.coroutines.launch
+import androidx.compose.foundation.ExperimentalFoundationApi
+import androidx.compose.foundation.combinedClickable
+import androidx.compose.material.icons.filled.NotificationsActive
+import androidx.compose.material.icons.filled.PushPin
+import androidx.compose.material3.DropdownMenu
+import androidx.compose.material3.DropdownMenuItem
 
-@OptIn(ExperimentalMaterial3Api::class)
+@OptIn(ExperimentalMaterial3Api::class, ExperimentalFoundationApi::class)
 @Composable
 fun ChatsScreen(onProfile: () -> Unit, onSettings: () -> Unit) {
     val repo = LocalRepo.current
     val chats by repo.chats.collectAsState()
     val me by repo.me.collectAsState()
     val connection by repo.connection.collectAsState()
+    val typing by repo.typing.collectAsState()
+    var menuFor by remember { mutableStateOf<Long?>(null) }
     var query by rememberSaveable { mutableStateOf("") }
     var searching by rememberSaveable { mutableStateOf(false) }
     var confirmLogout by remember { mutableStateOf(false) }
@@ -172,8 +180,12 @@ fun ChatsScreen(onProfile: () -> Unit, onSettings: () -> Unit) {
             } else {
                 LazyColumn(Modifier.fillMaxSize(), contentPadding = pad) {
                     items(shown, key = { it.id }) { c ->
+                        Box {
                         ListItem(
-                            modifier = Modifier.clickable { repo.open(c.id) },
+                            modifier = Modifier.combinedClickable(
+                                onClick = { repo.open(c.id) },
+                                onLongClick = { menuFor = c.id },
+                            ),
                             leadingContent = { Avatar(c.avatar, c.id, c.title) },
                             headlineContent = {
                                 Row(verticalAlignment = Alignment.CenterVertically) {
@@ -190,7 +202,14 @@ fun ChatsScreen(onProfile: () -> Unit, onSettings: () -> Unit) {
                                     }
                                 }
                             },
-                            supportingContent = { Text(c.preview, maxLines = 1, overflow = TextOverflow.Ellipsis) },
+                            supportingContent = {
+                                val t = typing[c.id]
+                                if (t != null) {
+                                    Text(t, maxLines = 1, overflow = TextOverflow.Ellipsis, color = MaterialTheme.colorScheme.primary)
+                                } else {
+                                    Text(c.preview, maxLines = 1, overflow = TextOverflow.Ellipsis)
+                                }
+                            },
                             trailingContent = {
                                 Column(horizontalAlignment = Alignment.End) {
                                     Text(
@@ -203,10 +222,31 @@ fun ChatsScreen(onProfile: () -> Unit, onSettings: () -> Unit) {
                                             Modifier.padding(top = 4.dp),
                                             containerColor = if (c.muted) MaterialTheme.colorScheme.outline else MaterialTheme.colorScheme.primary,
                                         ) { Text("${c.unread}") }
+                                    } else if (c.pinned) {
+                                        Icon(
+                                            Icons.Filled.PushPin, "Закреплён",
+                                            Modifier.padding(top = 4.dp).size(16.dp),
+                                            tint = MaterialTheme.colorScheme.onSurfaceVariant,
+                                        )
                                     }
                                 }
                             },
                         )
+                        DropdownMenu(expanded = menuFor == c.id, onDismissRequest = { menuFor = null }) {
+                            DropdownMenuItem(
+                                text = { Text(if (c.pinned) "Открепить" else "Закрепить") },
+                                leadingIcon = { Icon(Icons.Filled.PushPin, null) },
+                                onClick = { menuFor = null; repo.togglePin(c.id, !c.pinned) },
+                            )
+                            DropdownMenuItem(
+                                text = { Text(if (c.muted) "Включить уведомления" else "Отключить уведомления") },
+                                leadingIcon = {
+                                    Icon(if (c.muted) Icons.Filled.NotificationsActive else Icons.Filled.NotificationsOff, null)
+                                },
+                                onClick = { menuFor = null; repo.setMuted(c.id, !c.muted) },
+                            )
+                        }
+                        }
                     }
                 }
             }

@@ -13,8 +13,8 @@ android {
         // 29: MediaRecorder умеет OGG/Opus (формат голосовых Telegram) только с API 29
         minSdk = 29
         targetSdk = 34
-        versionCode = 2
-        versionName = "2.0"
+        versionCode = 3
+        versionName = "2.1"
     }
     buildFeatures { compose = true }
     compileOptions {
@@ -39,6 +39,14 @@ dependencies {
     // Воспроизведение голосовых/аудио/видео
     implementation("androidx.media3:media3-exoplayer:1.4.1")
     implementation("androidx.media3:media3-ui:1.4.1")
+
+    // Запись видеосообщений (кружков)
+    val camerax = "1.3.4"
+    implementation("androidx.camera:camera-core:$camerax")
+    implementation("androidx.camera:camera-camera2:$camerax")
+    implementation("androidx.camera:camera-lifecycle:$camerax")
+    implementation("androidx.camera:camera-video:$camerax")
+    implementation("androidx.camera:camera-view:$camerax")
 
     // Предсобранный TDLib (JNI + обёртка org.drinkless.tdlib), через JitPack
     implementation("com.github.fazilus:tdlib-android:1.8.61")
