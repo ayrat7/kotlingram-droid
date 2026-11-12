@@ -226,11 +226,11 @@ fun ChatScreen(chatId: Long) {
                     }
                 }
             }
-            AnimatedVisibility(
-                showDown,
-                modifier = Modifier.align(Alignment.BottomEnd).padding(12.dp),
-            ) {
-                SmallFloatingActionButton(onClick = { uiScope.launch { listState.animateScrollToItem(0) } }) {
+            if (showDown) {
+                SmallFloatingActionButton(
+                    onClick = { uiScope.launch { listState.animateScrollToItem(0) } },
+                    modifier = Modifier.align(Alignment.BottomEnd).padding(12.dp),
+                ) {
                     Icon(Icons.Filled.KeyboardArrowDown, "Вниз")
                 }
             }
