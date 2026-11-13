@@ -43,7 +43,7 @@ dependencies {
     implementation("androidx.media3:media3-session:1.4.1")
 
     // Размытие панелей (стекло) — всё использование в ui/Glass.kt
-    implementation("dev.chrisbanes.haze:haze:1.1.1")
+    implementation("dev.chrisbanes.haze:haze:0.7.3")
     // Анимированные стикеры и подарки (.tgs = gzip-Lottie)
     implementation("com.airbnb.android:lottie-compose:6.5.2")
 

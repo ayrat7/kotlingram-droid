@@ -30,8 +30,8 @@ import androidx.compose.ui.unit.dp
 import dev.example.tg.TgApplication
 import dev.example.tg.data.AppSettings
 import dev.chrisbanes.haze.HazeState
-import dev.chrisbanes.haze.hazeEffect
-import dev.chrisbanes.haze.hazeSource
+import dev.chrisbanes.haze.hazeChild
+import dev.chrisbanes.haze.haze
 import kotlin.random.Random
 
 // ---------------------------------------------------------------------------------------------
@@ -40,7 +40,7 @@ import kotlin.random.Random
 // ---------------------------------------------------------------------------------------------
 
 /** Содержимое, которое просвечивает сквозь «стеклянные» панели. */
-fun Modifier.glassSource(state: HazeState): Modifier = this.hazeSource(state)
+fun Modifier.glassSource(state: HazeState): Modifier = this.haze(state)
 
 /**
  * «Стеклянная» панель: размытие того, что под ней, + лёгкая тонировка.
@@ -48,7 +48,7 @@ fun Modifier.glassSource(state: HazeState): Modifier = this.hazeSource(state)
  */
 @Composable
 fun Modifier.glassBar(state: HazeState, tint: Color, blur: Boolean = LocalBlur.current): Modifier =
-    if (blur) this.hazeEffect(state).background(tint.copy(alpha = 0.55f))
+    if (blur) this.hazeChild(state).background(tint.copy(alpha = 0.55f))
     else this.background(tint.copy(alpha = 0.92f))
 
 val LocalBlur = androidx.compose.runtime.staticCompositionLocalOf { true }
