@@ -140,6 +140,13 @@ private fun UserProfileScreen(card: UserCard?, onBack: () -> Unit) {
                     Spacer(Modifier.padding(start = 8.dp))
                     Text("Написать")
                 }
+                if (!card.isBot) {
+                    OutlinedButton({ repo.calls.start(card.id) }, Modifier.weight(1f)) {
+                        Icon(Icons.Filled.Call, null)
+                        Spacer(Modifier.padding(start = 8.dp))
+                        Text("Звонок")
+                    }
+                }
                 if (card.chatId != 0L) {
                     OutlinedButton({ repo.setMuted(card.chatId, !muted) }, Modifier.weight(1f)) {
                         Icon(if (muted) Icons.Filled.NotificationsActive else Icons.Filled.NotificationsOff, null)
@@ -175,6 +182,10 @@ private fun UserProfileScreen(card: UserCard?, onBack: () -> Unit) {
                     color = MaterialTheme.colorScheme.onSurfaceVariant,
                     modifier = Modifier.padding(top = 8.dp),
                 )
+            }
+            Column(Modifier.fillMaxWidth()) {
+                GiftsSection(card.id)
+                ProfileMusicSection(card.id)
             }
             Spacer(Modifier.height(24.dp))
         }

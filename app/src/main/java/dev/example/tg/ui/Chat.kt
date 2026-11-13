@@ -92,6 +92,19 @@ import androidx.compose.material3.SmallFloatingActionButton
 import androidx.compose.runtime.derivedStateOf
 import dev.example.tg.data.PresenceKind
 import java.time.LocalDate
+import androidx.compose.material.icons.filled.Call
+import androidx.compose.material.icons.filled.CameraAlt
+import androidx.compose.material3.TextButton
+import androidx.compose.material3.TopAppBarDefaults
+import androidx.compose.runtime.MutableState
+import androidx.compose.ui.layout.onSizeChanged
+import androidx.compose.ui.platform.LocalDensity
+import dev.chrisbanes.haze.HazeState
+import dev.example.tg.data.Btn
+import dev.example.tg.data.BtnAction
+import dev.example.tg.data.BotUi
+import dev.example.tg.data.Markup
+import dev.example.tg.data.Track
 
 /** Что сейчас «прикреплено» к полю ввода: ответ или редактирование. */
 sealed interface Composing {
@@ -112,6 +125,9 @@ fun ChatScreen(chatId: Long) {
     val typing by repo.typing.collectAsState()
     val presence by repo.presence.collectAsState()
     val ps by player.state.collectAsState()
+    val bot by repo.currentBot.collectAsState()
+    val inlineRes by repo.inline.collectAsState()
+    val recordingNow by recorder.active.collectAsState()
     val round = remember { RoundState() }
     val peerId = chat?.userId ?: 0L
     val title = chat?.title ?: ""
@@ -121,22 +137,36 @@ fun ChatScreen(chatId: Long) {
     var forwardFor by remember { mutableStateOf<UiMsg?>(null) }
     var composing by remember { mutableStateOf<Composing?>(null) }
     var topMenu by remember { mutableStateOf(false) }
+    val draft = rememberSaveable { mutableStateOf("") }
+    var hiddenKb by remember { mutableStateOf(0L) }
     val clipboard = LocalClipboardManager.current
     val uiScope = rememberCoroutineScope()
     val listState = rememberLazyListState()
+    val hazeState = remember { HazeState() }
+    val density = LocalDensity.current
+    val pal = chatPalette()
+    var topH by remember { mutableStateOf(0) }
+    var botH by remember { mutableStateOf(0) }
     // reverseLayout: индекс 0 — самое новое, подгрузка старых не сдвигает прокрутку
     val reversed = remember(msgs) { msgs.asReversed() }
+    // очередь музыки чата (от старых к новым) для «следующий/предыдущий»
+    val audioQueue = remember(msgs) {
+        msgs.mapNotNull { m -> (m.media as? Media.Audio)?.let { Track(it.file, it.title, it.performer, it.duration, it.cover) } }
+    }
+    // клавиатура бота: последняя клавиатура ответа от собеседника, если её не убрали
+    val kbMsg = remember(msgs) { msgs.lastOrNull { !it.out && (it.markup is Markup.Keyboard || it.markup is Markup.Remove) } }
+    val kb = (kbMsg?.markup as? Markup.Keyboard)?.takeIf { kbMsg?.id != hiddenKb }
 
     DisposableEffect(chatId) {
         onDispose {
             recorder.cancel()
-            player.stop()
+            player.stopVoice()
             round.stop()
         }
     }
 
     // голосовое и кружок не играют одновременно
-    LaunchedEffect(ps.playing) { if (ps.playing) round.stop() }
+    LaunchedEffect(ps.playing) { if (ps.playing && ps.track == null) round.stop() }
     val showDown by remember { derivedStateOf { listState.firstVisibleItemIndex > 2 } }
 
     LaunchedEffect(reversed.firstOrNull()?.id) {
@@ -152,96 +182,156 @@ fun ChatScreen(chatId: Long) {
         }
     }
 
-    Column(Modifier.fillMaxSize().background(MaterialTheme.colorScheme.surface).imePadding()) {
-        TopAppBar(
-            title = {
-                Row(
-                    Modifier.clip(RoundedCornerShape(12.dp))
-                        .clickable(enabled = peerId != 0L) { repo.openUser(peerId) },
-                    verticalAlignment = Alignment.CenterVertically,
+    fun onBotButton(m: UiMsg, b: Btn) {
+        val a = b.action
+        if (a is BtnAction.SwitchInline) {
+            val u = bot?.username.orEmpty()
+            draft.value = if (u.isNotBlank()) "@$u ${a.query}" else a.query
+        } else repo.pressInline(m, b)
+    }
+
+    Box(Modifier.fillMaxSize().imePadding()) {
+        Box(Modifier.fillMaxSize().glassSource(hazeState)) {
+            BackgroundLayer()
+            androidx.compose.runtime.CompositionLocalProvider(LocalAudioQueue provides audioQueue) {
+                LazyColumn(
+                    Modifier.fillMaxSize(),
+                    state = listState,
+                    reverseLayout = true,
+                    contentPadding = PaddingValues(
+                        top = with(density) { topH.toDp() } + 8.dp,
+                        bottom = with(density) { botH.toDp() } + 8.dp,
+                    ),
+                    verticalArrangement = Arrangement.spacedBy(2.dp),
                 ) {
-                    Avatar(chat?.avatar, chatId, title, 40.dp)
-                    Spacer(Modifier.width(12.dp))
-                    Column {
-                        Text(title, fontWeight = FontWeight.Bold, maxLines = 1, overflow = TextOverflow.Ellipsis)
-                        val typingLabel = typing[chatId]
-                        val sub = typingLabel ?: if (chat?.isPrivate == true) presenceText(presence[peerId]) else ""
-                        if (sub.isNotEmpty()) {
-                            val online = typingLabel != null || presence[peerId]?.kind == PresenceKind.Online
-                            Text(
-                                sub, style = MaterialTheme.typography.bodySmall, maxLines = 1,
-                                overflow = TextOverflow.Ellipsis,
-                                color = if (online) MaterialTheme.colorScheme.primary
-                                else MaterialTheme.colorScheme.onSurfaceVariant,
+                    itemsIndexed(reversed, key = { _, m -> m.id }) { i, m ->
+                        val older = reversed.getOrNull(i + 1)
+                        val newer = reversed.getOrNull(i - 1)
+                        val tail = newer == null || newer.out != m.out || newer.senderId != m.senderId ||
+                            dayOf(newer.time) != dayOf(m.time)
+                        val groupStart = older == null || older.out != m.out || older.senderId != m.senderId
+                        Column(Modifier.padding(top = if (groupStart) 6.dp else 0.dp)) {
+                            if (older == null || dayOf(older.time) != dayOf(m.time)) DaySeparator(dayOf(m.time))
+                            MessageItem(
+                                m,
+                                round = round,
+                                onOpen = { viewer = it },
+                                onLong = { menuFor = m },
+                                onJump = { id ->
+                                    val idx = reversed.indexOfFirst { it.id == id }
+                                    if (idx >= 0) uiScope.launch { listState.animateScrollToItem(idx) }
+                                },
+                                onReply = { composing = Composing.Reply(m) },
+                                onProfile = { repo.openUser(it) },
+                                tail = tail,
+                                onBtn = { mm, b -> onBotButton(mm, b) },
                             )
                         }
                     }
                 }
-            },
-            navigationIcon = {
-                IconButton({ repo.close() }) { Icon(Icons.AutoMirrored.Filled.ArrowBack, "Назад") }
-            },
-            actions = {
-                Box {
-                    IconButton({ topMenu = true }) { Icon(Icons.Filled.MoreVert, "Меню") }
-                    DropdownMenu(expanded = topMenu, onDismissRequest = { topMenu = false }) {
-                        val muted = chat?.muted == true
-                        DropdownMenuItem(
-                            text = { Text(if (muted) "Включить уведомления" else "Отключить уведомления") },
-                            leadingIcon = {
-                                Icon(if (muted) Icons.Filled.NotificationsActive else Icons.Filled.NotificationsOff, null)
-                            },
-                            onClick = { topMenu = false; repo.setMuted(chatId, !muted) },
-                        )
-                    }
-                }
-            },
-        )
-        if (preparing) LinearProgressIndicator(Modifier.fillMaxWidth())
-
-        Box(Modifier.weight(1f).fillMaxWidth()) {
-            LazyColumn(
-                Modifier.fillMaxSize(),
-                state = listState,
-                reverseLayout = true,
-                contentPadding = PaddingValues(vertical = 8.dp),
-                verticalArrangement = Arrangement.spacedBy(4.dp),
-            ) {
-                itemsIndexed(reversed, key = { _, m -> m.id }) { i, m ->
-                    val older = reversed.getOrNull(i + 1)
-                    Column {
-                        if (older == null || dayOf(older.time) != dayOf(m.time)) DaySeparator(dayOf(m.time))
-                        MessageItem(
-                            m,
-                            round = round,
-                            onOpen = { viewer = it },
-                            onLong = { menuFor = m },
-                            onJump = { id ->
-                                val idx = reversed.indexOfFirst { it.id == id }
-                                if (idx >= 0) uiScope.launch { listState.animateScrollToItem(idx) }
-                            },
-                            onReply = { composing = Composing.Reply(m) },
-                            onProfile = { repo.openUser(it) },
-                        )
-                    }
-                }
             }
-            if (showDown) {
-                SmallFloatingActionButton(
-                    onClick = { uiScope.launch { listState.animateScrollToItem(0) } },
-                    modifier = Modifier.align(Alignment.BottomEnd).padding(12.dp),
-                ) {
-                    Icon(Icons.Filled.KeyboardArrowDown, "Вниз")
-                }
+            val b = bot
+            if (msgs.isEmpty() && b != null) {
+                BotStartCard(b, Modifier.align(Alignment.Center)) { repo.send("/start") }
             }
         }
 
-        InputBar(
-            composing = composing,
-            onComposingChange = { composing = it },
-            onVideoStart = { round.stop() },
-            modifier = Modifier.navigationBarsPadding(),
-        )
+        // верхняя «стеклянная» панель
+        Column(
+            Modifier.align(Alignment.TopCenter).fillMaxWidth()
+                .onSizeChanged { topH = it.height }
+                .glassBar(hazeState, pal.glass),
+        ) {
+            TopAppBar(
+                colors = TopAppBarDefaults.topAppBarColors(
+                    containerColor = Color.Transparent, scrolledContainerColor = Color.Transparent,
+                ),
+                title = {
+                    Row(
+                        Modifier.clip(RoundedCornerShape(12.dp))
+                            .clickable(enabled = peerId != 0L) { repo.openUser(peerId) },
+                        verticalAlignment = Alignment.CenterVertically,
+                    ) {
+                        Avatar(chat?.avatar, chatId, title, 40.dp)
+                        Spacer(Modifier.width(12.dp))
+                        Column {
+                            Text(title, fontWeight = FontWeight.Bold, maxLines = 1, overflow = TextOverflow.Ellipsis)
+                            val typingLabel = typing[chatId]
+                            val sub = typingLabel
+                                ?: if (bot != null) "бот" else if (chat?.isPrivate == true) presenceText(presence[peerId]) else ""
+                            if (sub.isNotEmpty()) {
+                                val online = typingLabel != null || (bot == null && presence[peerId]?.kind == PresenceKind.Online)
+                                Text(
+                                    sub, style = MaterialTheme.typography.bodySmall, maxLines = 1,
+                                    overflow = TextOverflow.Ellipsis,
+                                    color = if (online) MaterialTheme.colorScheme.primary
+                                    else MaterialTheme.colorScheme.onSurfaceVariant,
+                                )
+                            }
+                        }
+                    }
+                },
+                navigationIcon = {
+                    IconButton({ repo.close() }) { Icon(Icons.AutoMirrored.Filled.ArrowBack, "Назад") }
+                },
+                actions = {
+                    if (chat?.isPrivate == true && bot == null && peerId != 0L) {
+                        IconButton({ repo.calls.start(peerId) }) { Icon(Icons.Filled.Call, "Позвонить") }
+                    }
+                    Box {
+                        IconButton({ topMenu = true }) { Icon(Icons.Filled.MoreVert, "Меню") }
+                        DropdownMenu(expanded = topMenu, onDismissRequest = { topMenu = false }) {
+                            val muted = chat?.muted == true
+                            DropdownMenuItem(
+                                text = { Text(if (muted) "Включить уведомления" else "Отключить уведомления") },
+                                leadingIcon = {
+                                    Icon(if (muted) Icons.Filled.NotificationsActive else Icons.Filled.NotificationsOff, null)
+                                },
+                                onClick = { topMenu = false; repo.setMuted(chatId, !muted) },
+                            )
+                        }
+                    }
+                },
+            )
+            MiniPlayer()
+            if (preparing) LinearProgressIndicator(Modifier.fillMaxWidth())
+        }
+
+        // нижняя панель: inline-подсказки, клавиатура бота, поле ввода
+        Column(
+            Modifier.align(Alignment.BottomCenter).fillMaxWidth()
+                .onSizeChanged { botH = it.height }
+                .glassBar(hazeState, pal.glass)
+                .navigationBarsPadding(),
+        ) {
+            inlineRes?.let { r ->
+                if (r.items.isNotEmpty()) InlineResultsPanel(r) { repo.sendInlineResult(r, it); draft.value = "" }
+            }
+            if (kb != null && !recordingNow) {
+                ReplyKeyboardPanel(kb) { b ->
+                    repo.pressKeyboard(b)
+                    if (kb.oneTime) hiddenKb = kbMsg?.id ?: 0L
+                }
+            }
+            InputBar(
+                chatId = chatId,
+                draftState = draft,
+                composing = composing,
+                onComposingChange = { composing = it },
+                onVideoStart = { round.stop() },
+                bot = bot,
+                placeholder = kb?.placeholder.orEmpty(),
+            )
+        }
+
+        if (showDown) {
+            SmallFloatingActionButton(
+                onClick = { uiScope.launch { listState.animateScrollToItem(0) } },
+                modifier = Modifier.align(Alignment.BottomEnd).padding(end = 12.dp, bottom = with(density) { botH.toDp() } + 12.dp),
+            ) {
+                Icon(Icons.Filled.KeyboardArrowDown, "Вниз")
+            }
+        }
     }
 
     viewer?.let { MediaViewer(it) { viewer = null } }
@@ -271,7 +361,7 @@ fun ChatScreen(chatId: Long) {
 @Composable
 private fun DaySeparator(d: LocalDate) {
     Box(Modifier.fillMaxWidth().padding(vertical = 8.dp), contentAlignment = Alignment.Center) {
-        Surface(color = MaterialTheme.colorScheme.surfaceContainerHighest, shape = RoundedCornerShape(12.dp)) {
+        Surface(color = MaterialTheme.colorScheme.surfaceContainerHighest.copy(alpha = 0.7f), shape = RoundedCornerShape(12.dp)) {
             Text(
                 dayLabel(d), style = MaterialTheme.typography.labelMedium,
                 modifier = Modifier.padding(horizontal = 12.dp, vertical = 4.dp),
@@ -291,9 +381,13 @@ private fun PulsingDot() {
 
 @Composable
 private fun InputBar(
+    chatId: Long,
+    draftState: MutableState<String>,
     composing: Composing?,
     onComposingChange: (Composing?) -> Unit,
     onVideoStart: () -> Unit,
+    bot: BotUi?,
+    placeholder: String,
     modifier: Modifier = Modifier,
 ) {
     val repo = LocalRepo.current
@@ -304,8 +398,28 @@ private fun InputBar(
     val recording by recorder.active.collectAsState()
     val elapsed by recorder.elapsedMs.collectAsState()
     val level by recorder.level.collectAsState()
-    var text by rememberSaveable { mutableStateOf("") }
+    var text by draftState
     var attachMenu by remember { mutableStateOf(false) }
+    var commandsOpen by remember { mutableStateOf(false) }
+    var cameraOpen by remember { mutableStateOf(false) }
+
+    // «@бот запрос» — inline-режим
+    LaunchedEffect(text) {
+        val m = Regex("^@([A-Za-z0-9_]{3,})\\s(.*)$", RegexOption.DOT_MATCHES_ALL).find(text)
+        if (m != null && composing !is Composing.Edit) {
+            kotlinx.coroutines.delay(350)
+            repo.inlineQuery(m.groupValues[1], m.groupValues[2])
+        } else repo.clearInline()
+    }
+    val cameraPermissions = rememberLauncherForActivityResult(ActivityResultContracts.RequestMultiplePermissions()) { r ->
+        if (r[Manifest.permission.CAMERA] == true) { player.pause(); cameraOpen = true }
+        else repo.error.value = "Для камеры нужен доступ к ней"
+    }
+    fun onCamera() {
+        val ok = ContextCompat.checkSelfPermission(ctx, Manifest.permission.CAMERA) == PackageManager.PERMISSION_GRANTED
+        if (ok) { player.pause(); cameraOpen = true }
+        else cameraPermissions.launch(arrayOf(Manifest.permission.CAMERA, Manifest.permission.RECORD_AUDIO))
+    }
 
     val pickMedia = rememberLauncherForActivityResult(ActivityResultContracts.PickMultipleVisualMedia(10)) { uris ->
         repo.sendUris(uris, asFile = false)
@@ -415,6 +529,11 @@ private fun InputBar(
                                 },
                             )
                             DropdownMenuItem(
+                                text = { Text("Камера") },
+                                leadingIcon = { Icon(Icons.Filled.CameraAlt, null) },
+                                onClick = { attachMenu = false; onCamera() },
+                            )
+                            DropdownMenuItem(
                                 text = { Text("Файл") },
                                 leadingIcon = { Icon(Icons.Filled.Description, null) },
                                 onClick = { attachMenu = false; pickFile.launch("*/*") },
@@ -425,7 +544,7 @@ private fun InputBar(
                         value = text,
                         onValueChange = { text = it },
                         modifier = Modifier.weight(1f),
-                        placeholder = { Text("Сообщение") },
+                        placeholder = { Text(placeholder.ifBlank { "Сообщение" }) },
                         maxLines = 6,
                         colors = TextFieldDefaults.colors(
                             focusedContainerColor = Color.Transparent,
@@ -437,8 +556,24 @@ private fun InputBar(
                         ),
                     )
                     if (text.isBlank()) {
-                        IconButton({ onVideo() }, Modifier.heightIn(min = 52.dp)) {
-                            Icon(Icons.Filled.Videocam, "Видеосообщение")
+                        if (bot != null && bot.menuUrl.isNotBlank()) {
+                            TextButton(
+                                { repo.openWebApp(chatId, bot.userId, bot.menuUrl, bot.menuText) },
+                                Modifier.heightIn(min = 52.dp),
+                            ) { Text(bot.menuText.ifBlank { "Меню" }, maxLines = 1) }
+                        }
+                        if (bot != null && bot.commands.isNotEmpty()) {
+                            IconButton({ commandsOpen = true }, Modifier.heightIn(min = 52.dp)) {
+                                Text("/", style = MaterialTheme.typography.titleLarge, color = cs.primary)
+                            }
+                        }
+                        IconButton({ onCamera() }, Modifier.heightIn(min = 52.dp)) {
+                            Icon(Icons.Filled.CameraAlt, "Камера")
+                        }
+                        if (bot == null) {
+                            IconButton({ onVideo() }, Modifier.heightIn(min = 52.dp)) {
+                                Icon(Icons.Filled.Videocam, "Видеосообщение")
+                            }
                         }
                     }
                 }
@@ -473,6 +608,22 @@ private fun InputBar(
                 contentDescription = if (canSend) "Отправить" else "Записать голосовое",
             )
         }
+    }
+    if (commandsOpen && bot != null) {
+        BotCommandsSheet(bot, onDismiss = { commandsOpen = false }) { cmd ->
+            commandsOpen = false
+            repo.send("/$cmd")
+        }
+    }
+    if (cameraOpen) {
+        CameraCapture(
+            onDismiss = { cameraOpen = false },
+            onCaptured = { file ->
+                cameraOpen = false
+                repo.sendUris(listOf(android.net.Uri.fromFile(file)), asFile = false)
+                onComposingChange(null)
+            },
+        )
     }
     if (videoOpen) {
         VideoNoteRecorder(

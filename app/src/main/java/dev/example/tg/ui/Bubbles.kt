@@ -88,7 +88,10 @@ import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import coil.compose.AsyncImage
+import dev.example.tg.data.Btn
+import dev.example.tg.data.Markup
 import dev.example.tg.data.Media
+import dev.example.tg.data.Track
 import dev.example.tg.data.ReplyPreview
 import dev.example.tg.data.UiMsg
 import dev.example.tg.media.Waveform
@@ -128,6 +131,8 @@ fun MessageItem(
     onJump: (Long) -> Unit,
     onReply: () -> Unit,
     onProfile: (Long) -> Unit,
+    tail: Boolean = true,
+    onBtn: (UiMsg, Btn) -> Unit = { _, _ -> },
 ) {
     val media = m.media
     val cs = MaterialTheme.colorScheme
@@ -163,10 +168,15 @@ fun MessageItem(
             Modifier.fillMaxWidth().padding(horizontal = 8.dp).offset { IntOffset(offset.value.roundToInt(), 0) },
             contentAlignment = if (m.out) Alignment.CenterEnd else Alignment.CenterStart,
         ) {
-            when {
-                media is Media.Sticker -> StickerMessage(m, media, onLong)
-                media is Media.Video && media.round -> RoundVideoMessage(m, media, round, onLong)
-                else -> Bubble(m, onOpen, onLong, onJump, onProfile)
+            Column(horizontalAlignment = if (m.out) Alignment.End else Alignment.Start) {
+                when {
+                    media is Media.Sticker -> StickerMessage(m, media, onLong)
+                    media is Media.Video && media.round -> RoundVideoMessage(m, media, round, onLong)
+                    else -> Bubble(m, tail, onOpen, onLong, onJump, onProfile)
+                }
+                (m.markup as? Markup.Inline)?.let { mk ->
+                    InlineKeyboard(mk, Modifier.widthIn(max = 320.dp).padding(top = 3.dp)) { b -> onBtn(m, b) }
+                }
             }
         }
     }
@@ -174,28 +184,31 @@ fun MessageItem(
 
 @OptIn(ExperimentalFoundationApi::class)
 @Composable
-private fun Bubble(m: UiMsg, onOpen: (Media) -> Unit, onLong: () -> Unit, onJump: (Long) -> Unit, onProfile: (Long) -> Unit) {
+private fun Bubble(m: UiMsg, tail: Boolean, onOpen: (Media) -> Unit, onLong: () -> Unit, onJump: (Long) -> Unit, onProfile: (Long) -> Unit) {
     val cs = MaterialTheme.colorScheme
+    val pal = chatPalette()
     val media = m.media
     val visual = media is Media.Photo || media is Media.Video
     val overlayMeta = visual && m.text.isBlank()
+    val bubble = BubbleShape(m.out, tail)
     val shape = RoundedCornerShape(
         topStart = 18.dp, topEnd = 18.dp,
-        bottomStart = if (m.out) 18.dp else 4.dp,
-        bottomEnd = if (m.out) 4.dp else 18.dp,
+        bottomStart = if (!m.out && tail) 3.dp else 18.dp,
+        bottomEnd = if (m.out && tail) 3.dp else 18.dp,
     )
-    Surface(
-        color = if (m.out) cs.primaryContainer else cs.surfaceContainerHigh,
-        contentColor = if (m.out) cs.onPrimaryContainer else cs.onSurface,
-        shape = shape,
+    androidx.compose.runtime.CompositionLocalProvider(
+        LocalContentColor provides (if (m.out) pal.outText else pal.inText),
+    ) {
+    Box(
         modifier = (if (visual) Modifier.width(260.dp) else Modifier.widthIn(max = 320.dp))
+            .background(if (m.out) pal.outBubble else pal.inBubble, bubble)
             .clip(shape)
             .combinedClickable(onClick = {}, onLongClick = onLong),
     ) {
         Column {
             if (!m.out && m.from.isNotBlank()) {
                 Text(
-                    m.from, style = MaterialTheme.typography.labelLarge, color = cs.primary,
+                    m.from, style = MaterialTheme.typography.labelLarge, color = pal.inAccent,
                     modifier = Modifier
                         .clickable(enabled = m.senderId != 0L) { onProfile(m.senderId) }
                         .padding(start = 12.dp, end = 12.dp, top = 8.dp, bottom = if (visual) 6.dp else 0.dp),
@@ -228,6 +241,7 @@ private fun Bubble(m: UiMsg, onOpen: (Media) -> Unit, onLong: () -> Unit, onJump
                 if (overlayMeta) MetaPill(m, Modifier.align(Alignment.BottomEnd).padding(6.dp))
             }
         }
+    }
     }
 }
 
@@ -457,10 +471,12 @@ private fun RoundPlayer(path: String, round: RoundState) {
 @OptIn(ExperimentalFoundationApi::class)
 @Composable
 private fun StickerMessage(m: UiMsg, s: Media.Sticker, onLong: () -> Unit) {
-    val f = rememberFile(if (s.renderable) s.file else s.thumb)
+    val f = rememberFile(if (s.renderable || s.animated) s.file else s.thumb)
     Box(Modifier.size(160.dp).combinedClickable(onClick = {}, onLongClick = onLong)) {
         val path = f?.path
-        if (path != null) {
+        if (path != null && s.animated) {
+            TgsSticker(path, Modifier.fillMaxSize())
+        } else if (path != null) {
             AsyncImage(File(path), null, Modifier.fillMaxSize(), contentScale = ContentScale.Fit)
         } else {
             Text(s.emoji, fontSize = 64.sp, modifier = Modifier.align(Alignment.Center))
@@ -472,14 +488,14 @@ private fun StickerMessage(m: UiMsg, s: Media.Sticker, onLong: () -> Unit) {
 // ---------- Голосовые / аудио ----------
 
 @Composable
-private fun PlayButton(fileId: Int, playing: Boolean, onToggle: (path: String) -> Unit) {
+private fun PlayButton(fileId: Int, playing: Boolean, autoStart: Boolean = false, onToggle: (path: String) -> Unit) {
     val repo = LocalRepo.current
     val f = rememberFile(fileId)
     val cs = MaterialTheme.colorScheme
     Box(
         Modifier.size(44.dp).clip(CircleShape).background(cs.primary).clickable {
             val p = f?.path
-            if (p != null) onToggle(p) else repo.download(fileId)
+            if (p != null) onToggle(p) else if (autoStart) onToggle("") else repo.download(fileId)
         },
         contentAlignment = Alignment.Center,
     ) {
@@ -567,6 +583,7 @@ private fun VoiceContent(m: UiMsg, v: Media.Voice, onLong: () -> Unit) {
 private fun AudioContent(a: Media.Audio) {
     val player = LocalPlayer.current
     val ps by player.state.collectAsState()
+    val queue = LocalAudioQueue.current
     val active = ps.fileId == a.file
     val total = if (active && ps.durationMs > 0) ps.durationMs else a.duration * 1000L
     val progress = if (active && total > 0) (ps.positionMs / total.toFloat()).coerceIn(0f, 1f) else 0f
@@ -576,7 +593,11 @@ private fun AudioContent(a: Media.Audio) {
         verticalAlignment = Alignment.CenterVertically,
         horizontalArrangement = Arrangement.spacedBy(10.dp),
     ) {
-        PlayButton(a.file, active && ps.playing) { path -> player.toggle(a.file, path, a.duration * 1000L) }
+        PlayButton(a.file, active && ps.playing && !ps.loading, autoStart = true) { _ ->
+            val i = queue.indexOfFirst { it.fileId == a.file }
+            if (i >= 0) player.playQueue(queue, i)
+            else player.playQueue(listOf(Track(a.file, a.title, a.performer, a.duration, a.cover)), 0)
+        }
         Column(Modifier.width(190.dp)) {
             Text(a.title, fontWeight = FontWeight.SemiBold, maxLines = 1, overflow = TextOverflow.Ellipsis)
             val sub = buildString {

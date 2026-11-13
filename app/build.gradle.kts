@@ -13,8 +13,8 @@ android {
         // 29: MediaRecorder умеет OGG/Opus (формат голосовых Telegram) только с API 29
         minSdk = 29
         targetSdk = 34
-        versionCode = 3
-        versionName = "2.1"
+        versionCode = 4
+        versionName = "3.0"
     }
     buildFeatures { compose = true }
     compileOptions {
@@ -39,6 +39,13 @@ dependencies {
     // Воспроизведение голосовых/аудио/видео
     implementation("androidx.media3:media3-exoplayer:1.4.1")
     implementation("androidx.media3:media3-ui:1.4.1")
+    // Системные кнопки плеера (шторка, экран блокировки) для встроенной музыки
+    implementation("androidx.media3:media3-session:1.4.1")
+
+    // Размытие панелей (стекло) — всё использование в ui/Glass.kt
+    implementation("dev.chrisbanes.haze:haze:1.1.1")
+    // Анимированные стикеры и подарки (.tgs = gzip-Lottie)
+    implementation("com.airbnb.android:lottie-compose:6.5.2")
 
     // Запись видеосообщений (кружков)
     val camerax = "1.3.4"

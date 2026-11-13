@@ -13,6 +13,10 @@ import androidx.compose.runtime.CompositionLocalProvider
 import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.launch
 import dev.example.tg.data.AppSettings
 import dev.example.tg.data.TgRepo
 import dev.example.tg.media.Attachments
@@ -40,6 +44,12 @@ class TgApplication : Application() {
         repo = TgRepo(this, settings)
         player = AudioPlayer(this)
         recorder = VoiceRecorder(this)
+        player.pathOf = { id -> repo.files.value[id]?.path }
+        player.download = { id -> repo.download(id) }
+        // докачанный трек музыки стартует сам
+        CoroutineScope(SupervisorJob() + Dispatchers.Main).launch {
+            repo.files.collect { player.checkPending() }
+        }
         Thread { Attachments.cleanup(this) }.start()
         repo.start()
 

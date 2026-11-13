@@ -129,6 +129,13 @@ fun ProfileScreen(onBack: () -> Unit) {
                     enabled = changed && first.isNotBlank() && !busy,
                     modifier = Modifier.fillMaxWidth().height(50.dp),
                 ) { Text("Сохранить") }
+
+                if (p != null) {
+                    Column(Modifier.fillMaxWidth()) {
+                        GiftsSection(p.id)
+                        ProfileMusicSection(p.id)
+                    }
+                }
             }
         }
     }

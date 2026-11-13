@@ -39,6 +39,9 @@ import androidx.compose.material3.TextButton
 import androidx.compose.material3.TextField
 import androidx.compose.material3.TextFieldDefaults
 import androidx.compose.material3.TopAppBar
+import androidx.compose.material3.TopAppBarDefaults
+import androidx.compose.material3.ListItemDefaults
+import dev.chrisbanes.haze.HazeState
 import androidx.compose.material3.rememberDrawerState
 import androidx.compose.material3.DrawerValue
 import androidx.compose.runtime.Composable
@@ -133,10 +136,17 @@ fun ChatsScreen(onProfile: () -> Unit, onSettings: () -> Unit) {
             }
         },
     ) {
+        val hazeState = remember { HazeState() }
+        val pal = chatPalette()
         Scaffold(
+            containerColor = Color.Transparent,
             topBar = {
+                Column(Modifier.glassBar(hazeState, pal.glass)) {
                 if (searching) {
                     TopAppBar(
+                        colors = TopAppBarDefaults.topAppBarColors(
+                            containerColor = Color.Transparent, scrolledContainerColor = Color.Transparent,
+                        ),
                         title = {
                             TextField(
                                 value = query,
@@ -160,6 +170,9 @@ fun ChatsScreen(onProfile: () -> Unit, onSettings: () -> Unit) {
                     )
                 } else {
                     TopAppBar(
+                        colors = TopAppBarDefaults.topAppBarColors(
+                            containerColor = Color.Transparent, scrolledContainerColor = Color.Transparent,
+                        ),
                         title = {
                             Text(connection ?: "Telegram", fontWeight = FontWeight.Bold, maxLines = 1)
                         },
@@ -171,6 +184,8 @@ fun ChatsScreen(onProfile: () -> Unit, onSettings: () -> Unit) {
                         },
                     )
                 }
+                MiniPlayer()
+                }
             },
         ) { pad ->
             if (chats.isEmpty()) {
@@ -178,10 +193,13 @@ fun ChatsScreen(onProfile: () -> Unit, onSettings: () -> Unit) {
                     CircularProgressIndicator()
                 }
             } else {
+                Box(Modifier.fillMaxSize().glassSource(hazeState)) {
+                BackgroundLayer()
                 LazyColumn(Modifier.fillMaxSize(), contentPadding = pad) {
                     items(shown, key = { it.id }) { c ->
                         Box {
                         ListItem(
+                            colors = ListItemDefaults.colors(containerColor = Color.Transparent),
                             modifier = Modifier.combinedClickable(
                                 onClick = { repo.open(c.id) },
                                 onLongClick = { menuFor = c.id },
@@ -248,6 +266,7 @@ fun ChatsScreen(onProfile: () -> Unit, onSettings: () -> Unit) {
                         }
                         }
                     }
+                }
                 }
             }
         }

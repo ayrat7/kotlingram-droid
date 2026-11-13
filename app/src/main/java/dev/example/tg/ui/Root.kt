@@ -31,6 +31,7 @@ import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.Send
+import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Button
 import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.ElevatedCard
@@ -79,6 +80,9 @@ fun TgRoot() {
     val app = ctx.applicationContext as TgApplication
     val bgEnabled by app.settings.background.collectAsState()
     val snackbar = remember { SnackbarHostState() }
+    val webApp by repo.webApp.collectAsState()
+    val botAlert by repo.botAlert.collectAsState()
+    val urlToOpen by repo.urlToOpen.collectAsState()
     var screen by remember { mutableStateOf(Screen.Chats) }
 
     BackHandler(enabled = openId != null) { repo.close() }
@@ -99,6 +103,16 @@ fun TgRoot() {
         info?.let {
             snackbar.showSnackbar(it, duration = SnackbarDuration.Short)
             repo.info.value = null
+        }
+    }
+
+    // ссылки из кнопок ботов открываем во внешнем браузере
+    LaunchedEffect(urlToOpen) {
+        urlToOpen?.let {
+            runCatching {
+                ctx.startActivity(android.content.Intent(android.content.Intent.ACTION_VIEW, android.net.Uri.parse(it)).addFlags(android.content.Intent.FLAG_ACTIVITY_NEW_TASK))
+            }
+            repo.urlToOpen.value = null
         }
     }
 
@@ -130,6 +144,7 @@ fun TgRoot() {
         }
     }
 
+    GlassHost {
     Surface(Modifier.fillMaxSize(), color = MaterialTheme.colorScheme.background) {
         Box(Modifier.fillMaxSize()) {
             if (auth != Auth.Ready) {
@@ -150,6 +165,16 @@ fun TgRoot() {
                 }
                 // чужой профиль поверх чата — чтобы не терять черновик и положение ленты
                 UserProfileHost()
+                NowPlayingHost()
+                CallOverlay()
+                webApp?.let { WebAppDialog(it) { repo.closeWebApp() } }
+                botAlert?.let { msg ->
+                    AlertDialog(
+                        onDismissRequest = { repo.botAlert.value = null },
+                        confirmButton = { TextButton({ repo.botAlert.value = null }) { Text("OK") } },
+                        text = { Text(msg) },
+                    )
+                }
             }
             SnackbarHost(
                 snackbar,
@@ -167,5 +192,6 @@ fun TgRoot() {
                 }
             }
         }
+    }
     }
 }

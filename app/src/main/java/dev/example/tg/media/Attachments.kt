@@ -33,7 +33,10 @@ object Attachments {
     }
 
     fun prepare(ctx: Context, uri: Uri, asFile: Boolean): Prepared {
-        val mime = ctx.contentResolver.getType(uri).orEmpty()
+        val mime = ctx.contentResolver.getType(uri)
+            ?: android.webkit.MimeTypeMap.getSingleton()
+                .getMimeTypeFromExtension(uri.lastPathSegment?.substringAfterLast('.', "")?.lowercase().orEmpty())
+            ?: ""
         return when {
             asFile -> Prepared.Doc(copy(ctx, uri))
             mime.startsWith("image/") && mime != "image/gif" -> photo(ctx, uri)

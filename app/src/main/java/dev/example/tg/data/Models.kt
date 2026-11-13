@@ -50,7 +50,13 @@ sealed interface Media {
 
     class Voice(val file: Int, val duration: Int, val waveform: ByteArray, val listened: Boolean) : Media
 
-    class Audio(val file: Int, val title: String, val performer: String, val duration: Int) : Media
+    class Audio(
+        val file: Int,
+        val title: String,
+        val performer: String,
+        val duration: Int,
+        val cover: Int? = null,
+    ) : Media
 
     class Doc(val file: Int, val name: String, val mime: String) : Media
 
@@ -60,6 +66,8 @@ sealed interface Media {
         val emoji: String,
         /** true для webp — его умеем рисовать; tgs/webm показываем превью или эмодзи */
         val renderable: Boolean,
+        /** tgs (gzip-Lottie) — рисуем через Lottie */
+        val animated: Boolean = false,
     ) : Media
 }
 
@@ -77,6 +85,8 @@ data class UiMsg(
     val reply: ReplyPreview? = null,
     /** id отправителя-пользователя (для открытия профиля), 0 если неизвестно */
     val senderId: Long = 0L,
+    /** Клавиатура бота (inline-кнопки под сообщением или клавиатура ответа). */
+    val markup: Markup? = null,
 )
 
 /** Превью сообщения, на которое отвечает данное. */
@@ -145,4 +155,92 @@ data class CodeInfo(
     val canResend: Boolean,
     val timeout: Int,
     val stamp: Long,
+)
+
+
+// ---------- Боты ----------
+
+sealed interface BtnAction {
+    data class Url(val url: String) : BtnAction
+    class Callback(val data: ByteArray) : BtnAction
+    data class SwitchInline(val query: String) : BtnAction
+    data class WebApp(val url: String) : BtnAction
+    data class Copy(val text: String) : BtnAction
+
+    /** Кнопка клавиатуры ответа: просто отправить её текст. */
+    data object SendText : BtnAction
+    data object RequestPhone : BtnAction
+    data object Unsupported : BtnAction
+}
+
+data class Btn(val text: String, val action: BtnAction)
+
+sealed interface Markup {
+    data class Inline(val rows: List<List<Btn>>) : Markup
+    data class Keyboard(val rows: List<List<Btn>>, val oneTime: Boolean, val placeholder: String) : Markup
+    data object Remove : Markup
+}
+
+data class BotCommandUi(val command: String, val description: String)
+
+/** Бот, с которым открыт личный чат. */
+data class BotUi(
+    val userId: Long,
+    val username: String,
+    val description: String,
+    val commands: List<BotCommandUi>,
+    val menuText: String,
+    val menuUrl: String,
+)
+
+data class InlineResultUi(val id: String, val title: String, val subtitle: String)
+data class InlineResults(val queryId: Long, val query: String, val items: List<InlineResultUi>)
+data class WebAppSession(val title: String, val url: String, val launchId: Long)
+
+// ---------- Музыка ----------
+
+data class Track(
+    val fileId: Int,
+    val title: String,
+    val performer: String,
+    val durationSec: Int,
+    val cover: Int? = null,
+)
+
+// ---------- Подарки ----------
+
+data class GiftUi(
+    val key: String,
+    val title: String,
+    /** id файла стикера подарка */
+    val sticker: Int?,
+    /** tgs — Lottie, иначе картинка */
+    val animated: Boolean,
+    val stars: Long,
+    val upgraded: Boolean,
+    val number: Int,
+    val total: Int,
+    /** цвета фона для улучшенных подарков (RGB), 0 — нет */
+    val bgCenter: Int,
+    val bgEdge: Int,
+    val fromId: Long,
+    val fromName: String,
+    val text: String,
+    val date: Int,
+)
+
+// ---------- Звонки ----------
+
+enum class CallPhase { Ringing, Calling, Connecting, Active, Ended }
+
+data class UiCall(
+    val id: Int,
+    val userId: Long,
+    val name: String,
+    val avatar: Int?,
+    val outgoing: Boolean,
+    val phase: CallPhase,
+    val emojis: List<String> = emptyList(),
+    val startedAt: Long = 0L,
+    val note: String = "",
 )

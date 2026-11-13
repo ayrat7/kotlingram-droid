@@ -96,6 +96,8 @@ fun SettingsScreen(onBack: () -> Unit, onProfile: () -> Unit) {
     val preview by st.preview.collectAsState()
     val background by st.background.collectAsState()
     val dynamic by st.dynamicColor.collectAsState()
+    val blur by st.blur.collectAsState()
+    val pattern by st.pattern.collectAsState()
     val theme by st.theme.collectAsState()
     var confirmLogout by remember { mutableStateOf(false) }
     var confirmReset by remember { mutableStateOf(false) }
@@ -201,6 +203,9 @@ fun SettingsScreen(onBack: () -> Unit, onProfile: () -> Unit) {
                 SwitchRow("Цвета из обоев", "Material You: палитра подстраивается под систему", dynamic) { st.setDynamicColor(it) }
             }
 
+            SwitchRow("Размытие панелей", "Эффект стекла у верхней и нижней панелей (Android 12+)", blur) { st.setBlur(it) }
+            SwitchRow("Узор на фоне чата", "Лёгкие рисунки на градиентном фоне", pattern) { st.setPattern(it) }
+
             SectionTitle("Аккаунт")
             ListItem(
                 modifier = Modifier.clickable { confirmLogout = true },
@@ -214,7 +219,7 @@ fun SettingsScreen(onBack: () -> Unit, onProfile: () -> Unit) {
                 supportingContent = { Text("Удалит ключи и локальную базу, потребуется новый вход") },
             )
             Text(
-                "Kotlingram 2.0",
+                "Kotlingram 3.0",
                 style = MaterialTheme.typography.labelMedium,
                 color = MaterialTheme.colorScheme.onSurfaceVariant,
                 modifier = Modifier.padding(16.dp).align(Alignment.CenterHorizontally),

@@ -27,24 +27,25 @@ import kotlin.coroutines.resumeWithException
 
 /** Вся работа с TDLib. Состояние отдаётся наружу через StateFlow. */
 class TgRepo(private val app: Context, val settings: AppSettings) {
-    private val scope = CoroutineScope(SupervisorJob() + Dispatchers.Default)
+    internal val scope = CoroutineScope(SupervisorJob() + Dispatchers.Default)
     private val prefs = app.getSharedPreferences("tg", Context.MODE_PRIVATE)
 
     @Volatile private var client: Client? = null
-    @Volatile private var currentChatId = 0L
+    @Volatile internal var currentChatId = 0L
     @Volatile private var pendingReset = false
     @Volatile private var loadingOlder = false
     @Volatile private var reachedStart = false
     @Volatile private var emptyOlderTries = 0
-    @Volatile private var appForeground = false
-    @Volatile private var myId = 0L
+    @Volatile internal var appForeground = false
+    @Volatile internal var myId = 0L
 
     val notifier = Notifier(app)
+    val calls = CallManager(this, app)
     private val scopeMute = ConcurrentHashMap<String, Int>()
     private val replyCache = ConcurrentHashMap<String, ReplyPreview>()
 
-    private val chatMap = ConcurrentHashMap<Long, TdApi.Chat>()
-    private val userNames = ConcurrentHashMap<Long, String>()
+    internal val chatMap = ConcurrentHashMap<Long, TdApi.Chat>()
+    internal val userNames = ConcurrentHashMap<Long, String>()
 
     val auth = MutableStateFlow<Auth>(Auth.Starting)
     val chats = MutableStateFlow<List<ChatItem>>(emptyList())
@@ -74,6 +75,19 @@ class TgRepo(private val app: Context, val settings: AppSettings) {
     /** «Печатает…» по id чата. */
     val typing = MutableStateFlow<Map<Long, String>>(emptyMap())
     private val typingStamp = ConcurrentHashMap<Long, Long>()
+
+    /** Бот текущего чата, подсказки inline-режима, веб-приложение, всплывающие ответы бота. */
+    val currentBot = MutableStateFlow<BotUi?>(null)
+    val inline = MutableStateFlow<InlineResults?>(null)
+    val webApp = MutableStateFlow<WebAppSession?>(null)
+    val botAlert = MutableStateFlow<String?>(null)
+    /** Ссылка, которую нужно открыть во внешнем браузере (кнопки ботов). */
+    val urlToOpen = MutableStateFlow<String?>(null)
+    private val botIdCache = ConcurrentHashMap<String, Long>()
+
+    /** Подарки и музыка в профилях по id пользователя. */
+    val gifts = MutableStateFlow<Map<Long, List<GiftUi>>>(emptyMap())
+    val profileAudios = MutableStateFlow<Map<Long, List<Track>>>(emptyMap())
 
     /** Открытый чужой профиль. */
     val viewedUserId = MutableStateFlow<Long?>(null)
@@ -179,7 +193,7 @@ class TgRepo(private val app: Context, val settings: AppSettings) {
                     systemLanguageCode = Locale.getDefault().language
                     deviceModel = Build.MODEL
                     systemVersion = Build.VERSION.RELEASE
-                    applicationVersion = "2.1"
+                    applicationVersion = "3.0"
                 }
                 client?.send(p) { r -> if (r is TdApi.Error) error.value = "Ошибка параметров TDLib: ${r.message}" }
             }
@@ -268,7 +282,7 @@ class TgRepo(private val app: Context, val settings: AppSettings) {
         files.update { m -> if (m[st.id] == st) m else m + (st.id to st) }
     }
 
-    private fun reg(f: TdApi.File?) {
+    internal fun reg(f: TdApi.File?) {
         if (f != null) registerFile(f)
     }
 
@@ -343,12 +357,15 @@ class TgRepo(private val app: Context, val settings: AppSettings) {
         currentChatId = id
         openChatId.value = id
         messages.value = emptyList()
+        currentBot.value = null
+        inline.value = null
         reachedStart = false
         emptyOlderTries = 0
         notifier.cancel(id)
         scope.launch {
             try {
                 call(TdApi.OpenChat().apply { chatId = id })
+                loadBot(id)
                 val raw = fetchHistory(id, 0L, 40)
                 val ui = raw.sortedBy { it.id }.map { toUi(it) }
                 if (currentChatId == id) {
@@ -410,6 +427,8 @@ class TgRepo(private val app: Context, val settings: AppSettings) {
     fun close() {
         val id = currentChatId
         currentChatId = 0
+        currentBot.value = null
+        inline.value = null
         openChatId.value = null
         messages.value = emptyList()
         if (id != 0L) scope.launch { runCatching { call(TdApi.CloseChat().apply { chatId = id }) } }
@@ -629,8 +648,13 @@ class TgRepo(private val app: Context, val settings: AppSettings) {
                 publishChats()
             }
             is TdApi.UpdateMessageEdited -> if (u.chatId == currentChatId) {
-                messages.update { l -> l.map { if (it.id == u.messageId) it.copy(edited = u.editDate > 0) else it } }
+                val mk = toMarkup(u.replyMarkup)
+                messages.update { l ->
+                    l.map { if (it.id == u.messageId) it.copy(edited = u.editDate > 0, markup = mk) else it }
+                }
             }
+            is TdApi.UpdateCall -> calls.onCall(u.call)
+            is TdApi.UpdateNewCallSignalingData -> calls.onSignaling(u)
             is TdApi.UpdateMessageSendSucceeded -> if (u.message.chatId == currentChatId) {
                 scope.launch {
                     val ui = toUi(u.message)
@@ -997,9 +1021,264 @@ class TgRepo(private val app: Context, val settings: AppSettings) {
         }
     }
 
+    // ---------- Боты ----------
+
+    private fun loadBot(cid: Long) {
+        val uid = (chatMap[cid]?.type as? TdApi.ChatTypePrivate)?.userId
+        if (uid == null) {
+            currentBot.value = null
+            return
+        }
+        scope.launch {
+            try {
+                val u = call(TdApi.GetUser().apply { userId = uid }) as TdApi.User
+                if (u.type !is TdApi.UserTypeBot) return@launch
+                val uname = u.usernames?.activeUsernames?.firstOrNull().orEmpty()
+                if (currentChatId == cid) currentBot.value = BotUi(uid, uname, "", emptyList(), "", "")
+                val full = call(TdApi.GetUserFullInfo().apply { userId = uid }) as TdApi.UserFullInfo
+                val bi = full.botInfo ?: return@launch
+                if (currentChatId == cid) {
+                    currentBot.value = BotUi(
+                        userId = uid,
+                        username = uname,
+                        description = bi.description.orEmpty(),
+                        commands = bi.commands.orEmpty().map { BotCommandUi(it.command, it.description) },
+                        menuText = bi.menuButton?.text.orEmpty(),
+                        menuUrl = bi.menuButton?.url.orEmpty(),
+                    )
+                }
+            } catch (e: Exception) {
+                // без информации о боте чат остаётся обычным
+            }
+        }
+    }
+
+    private fun toMarkup(r: TdApi.ReplyMarkup?): Markup? = when (r) {
+        is TdApi.ReplyMarkupInlineKeyboard -> Markup.Inline(
+            r.rows.map { row ->
+                row.map { b ->
+                    Btn(
+                        b.text,
+                        when (val t = b.type) {
+                            is TdApi.InlineKeyboardButtonTypeUrl -> BtnAction.Url(t.url)
+                            is TdApi.InlineKeyboardButtonTypeCallback -> BtnAction.Callback(t.data)
+                            is TdApi.InlineKeyboardButtonTypeWebApp -> BtnAction.WebApp(t.url)
+                            is TdApi.InlineKeyboardButtonTypeSwitchInline -> BtnAction.SwitchInline(t.query)
+                            is TdApi.InlineKeyboardButtonTypeCopyText -> BtnAction.Copy(t.text)
+                            else -> BtnAction.Unsupported
+                        },
+                    )
+                }
+            },
+        )
+        is TdApi.ReplyMarkupShowKeyboard -> Markup.Keyboard(
+            r.rows.map { row ->
+                row.map { b ->
+                    Btn(
+                        b.text,
+                        when (b.type) {
+                            is TdApi.KeyboardButtonTypeText -> BtnAction.SendText
+                            is TdApi.KeyboardButtonTypeRequestPhoneNumber -> BtnAction.RequestPhone
+                            else -> BtnAction.Unsupported
+                        },
+                    )
+                }
+            },
+            r.oneTime,
+            r.inputFieldPlaceholder.orEmpty(),
+        )
+        is TdApi.ReplyMarkupRemoveKeyboard -> Markup.Remove
+        else -> null
+    }
+
+    /** Нажатие inline-кнопки (кроме switch-inline — его обрабатывает поле ввода). */
+    fun pressInline(m: UiMsg, b: Btn) {
+        when (val a = b.action) {
+            is BtnAction.Url -> urlToOpen.value = a.url
+            is BtnAction.Callback -> scope.launch {
+                try {
+                    val r = call(TdApi.GetCallbackQueryAnswer().apply {
+                        chatId = m.chatId
+                        messageId = m.id
+                        payload = TdApi.CallbackQueryPayloadData().apply { data = a.data }
+                    }) as TdApi.CallbackQueryAnswer
+                    when {
+                        !r.url.isNullOrBlank() -> urlToOpen.value = r.url
+                        !r.text.isNullOrBlank() -> if (r.showAlert) botAlert.value = r.text else info.value = r.text
+                    }
+                } catch (e: Exception) {
+                    error.value = "Бот не ответил: ${e.message}"
+                }
+            }
+            is BtnAction.WebApp -> openWebApp(m.chatId, m.senderId, a.url, b.text)
+            is BtnAction.Copy -> {
+                val cm = app.getSystemService(Context.CLIPBOARD_SERVICE) as android.content.ClipboardManager
+                cm.setPrimaryClip(android.content.ClipData.newPlainText("", a.text))
+                info.value = "Скопировано"
+            }
+            else -> info.value = "Эта кнопка пока не поддерживается"
+        }
+    }
+
+    /** Кнопка клавиатуры ответа. */
+    fun pressKeyboard(b: Btn) {
+        val cid = currentChatId
+        if (cid == 0L) return
+        when (b.action) {
+            is BtnAction.SendText -> send(b.text)
+            is BtnAction.RequestPhone -> {
+                val p = me.value ?: return
+                sendContent(cid, TdApi.InputMessageContact().apply {
+                    contact = TdApi.Contact(p.phone, p.firstName, p.lastName, "", p.id)
+                })
+            }
+            else -> info.value = "Эта кнопка пока не поддерживается"
+        }
+    }
+
+    /** Запуск мини-приложения бота (кнопка меню или кнопка web app). */
+    fun openWebApp(chatId: Long, botId: Long, url: String, title: String) {
+        if (botId == 0L) {
+            urlToOpen.value = url
+            return
+        }
+        scope.launch {
+            try {
+                val theme = Rf.new(
+                    "ThemeParameters",
+                    "backgroundColor" to 0xFF17212B.toInt(),
+                    "secondaryBackgroundColor" to 0xFF0E1621.toInt(),
+                    "headerBackgroundColor" to 0xFF17212B.toInt(),
+                    "bottomBarBackgroundColor" to 0xFF17212B.toInt(),
+                    "sectionBackgroundColor" to 0xFF1F2B38.toInt(),
+                    "sectionSeparatorColor" to 0xFF0E1621.toInt(),
+                    "textColor" to 0xFFFFFFFF.toInt(),
+                    "accentTextColor" to 0xFF6AB3F3.toInt(),
+                    "sectionHeaderTextColor" to 0xFF6AB3F3.toInt(),
+                    "subtitleTextColor" to 0xFF7D8E98.toInt(),
+                    "destructiveTextColor" to 0xFFEC3942.toInt(),
+                    "hintColor" to 0xFF708499.toInt(),
+                    "linkColor" to 0xFF6AB3F3.toInt(),
+                    "buttonColor" to 0xFF5288C1.toInt(),
+                    "buttonTextColor" to 0xFFFFFFFF.toInt(),
+                )
+                val params = Rf.new(
+                    "WebAppOpenParameters",
+                    "theme" to theme,
+                    "applicationName" to "Kotlingram",
+                    "mode" to Rf.new("WebAppOpenModeFullSize"),
+                )
+                val fn = Rf.fn("OpenWebApp", "chatId" to chatId, "botUserId" to botId, "url" to url, "parameters" to params)
+                    ?: throw IllegalStateException("OpenWebApp недоступен в этой версии TDLib")
+                val r = call(fn)
+                val u = Rf.str(r, "url").ifBlank { url }
+                webApp.value = WebAppSession(title.ifBlank { "Мини-приложение" }, u, Rf.long(r, "launchId"))
+            } catch (e: Exception) {
+                // без launchId приложение не авторизует пользователя, но обычный сайт откроем
+                urlToOpen.value = url
+            }
+        }
+    }
+
+    fun closeWebApp() {
+        val s = webApp.value ?: return
+        webApp.value = null
+        if (s.launchId != 0L) {
+            Rf.fn("CloseWebApp", "webAppLaunchId" to s.launchId)?.let { f -> client?.send(f, null) }
+        }
+    }
+
+    // inline-режим: «@бот запрос»
+
+    fun inlineQuery(botUsername: String, query: String) {
+        val cid = currentChatId
+        if (cid == 0L) return
+        scope.launch {
+            try {
+                val key = botUsername.lowercase()
+                val botId = botIdCache[key] ?: run {
+                    val c = call(TdApi.SearchPublicChat().apply { username = botUsername }) as TdApi.Chat
+                    val uid = (c.type as? TdApi.ChatTypePrivate)?.userId ?: return@launch
+                    botIdCache[key] = uid
+                    uid
+                }
+                val r = call(TdApi.GetInlineQueryResults().apply {
+                    botUserId = botId
+                    chatId = cid
+                    this.query = query
+                    offset = ""
+                }) as TdApi.InlineQueryResults
+                val items = r.results.mapNotNull { x ->
+                    when (x) {
+                        is TdApi.InlineQueryResultArticle -> InlineResultUi(x.id, x.title, x.description)
+                        is TdApi.InlineQueryResultPhoto -> InlineResultUi(x.id, x.title.ifBlank { "Фото" }, x.description)
+                        is TdApi.InlineQueryResultVideo -> InlineResultUi(x.id, x.title.ifBlank { "Видео" }, x.description)
+                        is TdApi.InlineQueryResultDocument -> InlineResultUi(x.id, x.title.ifBlank { "Файл" }, x.description)
+                        is TdApi.InlineQueryResultAnimation -> InlineResultUi(x.id, x.title.ifBlank { "GIF" }, "")
+                        is TdApi.InlineQueryResultSticker -> InlineResultUi(x.id, x.sticker.emoji + " Стикер", "")
+                        is TdApi.InlineQueryResultVoiceNote -> InlineResultUi(x.id, x.title.ifBlank { "Голосовое" }, "")
+                        else -> null
+                    }
+                }
+                if (currentChatId == cid) inline.value = InlineResults(r.inlineQueryId, query, items)
+            } catch (e: Exception) {
+                inline.value = null
+            }
+        }
+    }
+
+    fun clearInline() {
+        inline.value = null
+    }
+
+    fun sendInlineResult(res: InlineResults, item: InlineResultUi) {
+        val cid = currentChatId
+        if (cid == 0L) return
+        inline.value = null
+        scope.launch {
+            runCatching {
+                call(TdApi.SendInlineQueryResultMessage().apply {
+                    chatId = cid
+                    queryId = res.queryId
+                    resultId = item.id
+                    hideViaBot = false
+                })
+            }.onFailure { error.value = "Не отправлено: ${it.message}" }
+        }
+    }
+
+    // ---------- Подарки и музыка профиля ----------
+
+    fun loadGifts(userId: Long) {
+        if (userId == 0L) return
+        scope.launch {
+            val list = runCatching { ProfileExtras.gifts(this@TgRepo, userId) }.getOrDefault(emptyList())
+            gifts.update { it + (userId to list) }
+        }
+    }
+
+    fun loadProfileAudios(userId: Long) {
+        if (userId == 0L) return
+        scope.launch {
+            val list = runCatching { ProfileExtras.audios(this@TgRepo, userId) }.getOrDefault(emptyList())
+            profileAudios.update { it + (userId to list) }
+        }
+    }
+
+    internal suspend fun userName(id: Long): String {
+        if (id == 0L) return ""
+        userNames[id]?.let { return it }
+        return try {
+            val u = call(TdApi.GetUser().apply { userId = id }) as TdApi.User
+            "${u.firstName} ${u.lastName}".trim().also { userNames[id] = it }
+        } catch (e: Exception) {
+            ""
+        }
+    }
+
     // ---------- Хелперы ----------
 
-    private suspend fun call(f: TdApi.Function<*>): TdApi.Object = suspendCancellableCoroutine { cont ->
+    internal suspend fun call(f: TdApi.Function<*>): TdApi.Object = suspendCancellableCoroutine { cont ->
         val c = client
         if (c == null) {
             cont.resumeWithException(TdException("Клиент не запущен"))
@@ -1027,6 +1306,7 @@ class TgRepo(private val app: Context, val settings: AppSettings) {
             edited = m.editDate > 0,
             reply = replyPreview(m),
             senderId = (m.senderId as? TdApi.MessageSenderUser)?.userId ?: 0L,
+            markup = toMarkup(m.replyMarkup),
         )
     }
 
@@ -1109,8 +1389,9 @@ class TgRepo(private val app: Context, val settings: AppSettings) {
             is TdApi.MessageAudio -> {
                 val a = c.audio
                 reg(a.audio)
+                reg(a.albumCoverThumbnail?.file)
                 val title = a.title.ifBlank { a.fileName.ifBlank { "Аудио" } }
-                return c.caption.text to Media.Audio(a.audio.id, title, a.performer, a.duration)
+                return c.caption.text to Media.Audio(a.audio.id, title, a.performer, a.duration, a.albumCoverThumbnail?.file?.id)
             }
             is TdApi.MessageDocument -> {
                 val d = c.document
@@ -1121,7 +1402,11 @@ class TgRepo(private val app: Context, val settings: AppSettings) {
                 val s = c.sticker
                 reg(s.sticker)
                 reg(s.thumbnail?.file)
-                return "" to Media.Sticker(s.sticker.id, s.thumbnail?.file?.id, s.emoji, s.format is TdApi.StickerFormatWebp)
+                return "" to Media.Sticker(
+                    s.sticker.id, s.thumbnail?.file?.id, s.emoji,
+                    renderable = s.format is TdApi.StickerFormatWebp,
+                    animated = s.format is TdApi.StickerFormatTgs,
+                )
             }
             else -> {}
         }
@@ -1146,6 +1431,7 @@ class TgRepo(private val app: Context, val settings: AppSettings) {
         is TdApi.MessagePoll -> "📊 Опрос"
         is TdApi.MessageLocation -> "📍 Геопозиция"
         is TdApi.MessageContact -> "👤 Контакт"
+        is TdApi.MessageCall -> "📞 Звонок"
         else -> "[Вложение]"
     }
 }
